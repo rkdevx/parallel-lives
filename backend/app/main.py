@@ -8,7 +8,7 @@ import os
 import secrets
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
@@ -25,6 +25,42 @@ DATABASE_PATH = Path(os.environ.get("PARALLEL_LIVES_DB", APP_DIR / "parallel_liv
 ADMIN_TOKEN = os.environ.get("PARALLEL_LIVES_ADMIN_TOKEN", "dev-admin-token")
 DEMO_OTP = os.environ.get("PARALLEL_LIVES_DEMO_OTP", "123456")
 PUNE_BOUNDS = (18.4, 18.65, 73.7, 73.98)
+DAILY_PROMPTS = (
+    "What small thing made today feel a little more like yours?",
+    "What song feels like the background music to your week?",
+    "What is something ordinary you have been enjoying lately?",
+    "If you could keep one moment from today, which would it be?",
+    "What is a tiny thing you are looking forward to?",
+    "Where do you go when you need a little quiet?",
+    "What is something you wish more people noticed?",
+    "What would your ideal slow evening look like?",
+    "What is a small kindness you still remember?",
+    "What would you like to carry with you into tomorrow?",
+)
+DEMO_PROMPT_ANSWERS = (
+    "A quiet cup of chai and a few minutes with no rush.",
+    "Probably something soft that makes the walk home feel cinematic.",
+    "The light changing in the room around sunset.",
+)
+SHARE_MORE_DAY = 3
+REMATCH_AFTER_HOURS = 24
+ROOM_MESSAGE_LIMIT_PER_HOUR = 60
+ROOM_AMBIENCE_IDS = {
+    "room-tone",
+    "rain-on-glass",
+    "river-walk",
+    "morning-birds",
+    "wind-in-leaves",
+    "ocean-hush",
+    "night-crickets",
+    "cafe-window",
+    "forest-dawn",
+    "soft-fireplace",
+}
+MATCH_QUEUE_TTL_MINUTES = 10
+MATCH_USER_ACTIVE_MINUTES = 2
+GROUP_FALLBACK_AFTER_SECONDS = 120
+GROUP_MATCHING_RADIUS_KM = 40
 
 
 @asynccontextmanager
@@ -80,6 +116,7 @@ def initialize_database() -> None:
                 is_banned INTEGER NOT NULL DEFAULT 0,
                 is_shadow_banned INTEGER NOT NULL DEFAULT 0,
                 is_muted INTEGER NOT NULL DEFAULT 0,
+                last_seen_at TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessions (
@@ -87,6 +124,35 @@ def initialize_database() -> None:
                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS match_queue (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                vibe_filters TEXT NOT NULL DEFAULT '[]',
+                queued_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS group_rooms (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                dissolved_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                joined_at TEXT NOT NULL,
+                left_at TEXT,
+                PRIMARY KEY (group_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS active_group_members_by_user
+                ON group_members(user_id, left_at);
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
+                author_id TEXT NOT NULL REFERENCES users(id),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS group_messages_by_group
+                ON group_messages(group_id, created_at);
             CREATE TABLE IF NOT EXISTS app_settings (
                 setting_key TEXT PRIMARY KEY,
                 setting_value INTEGER NOT NULL
@@ -100,6 +166,8 @@ def initialize_database() -> None:
                 status TEXT NOT NULL DEFAULT 'active',
                 user1_vote INTEGER,
                 user2_vote INTEGER,
+                user1_share_vote INTEGER,
+                user2_share_vote INTEGER,
                 created_at TEXT NOT NULL,
                 dissolved_at TEXT
             );
@@ -134,6 +202,30 @@ def initialize_database() -> None:
                 action TEXT NOT NULL,
                 PRIMARY KEY (room_id, user_id, action_date, action)
             );
+            CREATE TABLE IF NOT EXISTS daily_prompt_answers (
+                room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                prompt_day INTEGER NOT NULL,
+                answer TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (room_id, user_id, prompt_day)
+            );
+            CREATE TABLE IF NOT EXISTS room_messages (
+                id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                author_id TEXT NOT NULL REFERENCES users(id),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS room_messages_by_room
+                ON room_messages(room_id, created_at);
+            CREATE TABLE IF NOT EXISTS blocks (
+                blocker_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                blocked_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (blocker_id, blocked_user_id),
+                CHECK (blocker_id <> blocked_user_id)
+            );
             CREATE TABLE IF NOT EXISTS friendships (
                 id TEXT PRIMARY KEY,
                 user1_id TEXT NOT NULL REFERENCES users(id),
@@ -165,11 +257,24 @@ def initialize_database() -> None:
             db.execute("ALTER TABLE users ADD COLUMN vibe_tags TEXT NOT NULL DEFAULT '[]'")
         if "is_demo" not in columns:
             db.execute("ALTER TABLE users ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
+        if "last_seen_at" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+        room_columns = {row["name"] for row in db.execute("PRAGMA table_info(rooms)")}
+        if "user1_share_vote" not in room_columns:
+            db.execute("ALTER TABLE rooms ADD COLUMN user1_share_vote INTEGER")
+        if "user2_share_vote" not in room_columns:
+            db.execute("ALTER TABLE rooms ADD COLUMN user2_share_vote INTEGER")
         db.execute(
-            "INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('matching_radius_km', 5)"
+            "INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('matching_radius_km', 40)"
         )
         db.execute(
-            "INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('unmask_day_threshold', 10)"
+            "UPDATE app_settings SET setting_value = 40 WHERE setting_key = 'matching_radius_km' AND setting_value = 5"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('unmask_day_threshold', 3)"
+        )
+        db.execute(
+            "UPDATE app_settings SET setting_value = 3 WHERE setting_key = 'unmask_day_threshold' AND setting_value = 10"
         )
 
 
@@ -195,6 +300,7 @@ def get_user_id(authorization: str | None) -> str:
         ).fetchone()
         if user is None or user["is_banned"]:
             raise HTTPException(status_code=403, detail="This account cannot access the app")
+        db.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", (now_iso(), session["user_id"]))
         return str(session["user_id"])
 
 
@@ -222,6 +328,105 @@ def active_room_for_user(db: sqlite3.Connection, user_id: str) -> sqlite3.Row | 
     ).fetchone()
 
 
+def active_group_for_user(db: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
+    return db.execute(
+        """SELECT g.* FROM group_rooms g JOIN group_members m ON m.group_id = g.id
+           WHERE g.status = 'active' AND m.user_id = ? AND m.left_at IS NULL LIMIT 1""",
+        (user_id,),
+    ).fetchone()
+
+
+def serialize_group(db: sqlite3.Connection, group: sqlite3.Row, user_id: str) -> dict[str, Any]:
+    members = db.execute(
+        """SELECT u.id, u.anonymous_handle, u.neighborhood_tag, u.verification_tier
+           FROM group_members m JOIN users u ON u.id = m.user_id
+           WHERE m.group_id = ? AND m.left_at IS NULL ORDER BY m.joined_at""",
+        (group["id"],),
+    ).fetchall()
+    return {
+        "group_id": group["id"],
+        "created_at": group["created_at"],
+        "members": [dict(member) for member in members],
+        "member_count": len(members),
+        "you_id": user_id,
+    }
+
+
+def distance_between_km(first_lat: float, first_lng: float, second_lat: float, second_lng: float) -> float:
+    latitude_delta = math.radians(first_lat - second_lat)
+    longitude_delta = math.radians(first_lng - second_lng)
+    haversine = math.sin(latitude_delta / 2) ** 2 + math.cos(math.radians(first_lat)) * math.cos(
+        math.radians(second_lat)
+    ) * math.sin(longitude_delta / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(haversine))
+
+
+def pair_is_blocked(db: sqlite3.Connection, first_id: str, second_id: str) -> bool:
+    return db.execute(
+        """SELECT 1 FROM blocks WHERE
+           (blocker_id = ? AND blocked_user_id = ?) OR (blocker_id = ? AND blocked_user_id = ?)""",
+        (first_id, second_id, second_id, first_id),
+    ).fetchone() is not None
+
+
+def create_group_from_queue(db: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
+    now = datetime.now(timezone.utc)
+    queue_cutoff = (now - timedelta(seconds=GROUP_FALLBACK_AFTER_SECONDS)).isoformat()
+    active_cutoff = (now - timedelta(minutes=MATCH_USER_ACTIVE_MINUTES)).isoformat()
+    waiting = db.execute(
+        """SELECT q.user_id, q.vibe_filters, q.queued_at, u.latitude, u.longitude,
+                  u.vibe_tags, u.last_seen_at
+           FROM match_queue q JOIN users u ON u.id = q.user_id
+           WHERE q.queued_at <= ? AND u.is_demo = 0 AND u.last_seen_at >= ?
+             AND NOT EXISTS (
+                 SELECT 1 FROM rooms r WHERE r.status = 'active'
+                   AND (r.user1_id = q.user_id OR r.user2_id = q.user_id)
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM group_members gm JOIN group_rooms gr ON gr.id = gm.group_id
+                 WHERE gm.user_id = q.user_id AND gm.left_at IS NULL AND gr.status = 'active'
+             )
+           ORDER BY q.queued_at""",
+        (queue_cutoff, active_cutoff),
+    ).fetchall()
+    current = next((member for member in waiting if member["user_id"] == user_id), None)
+    if current is None:
+        return None
+
+    group_members = [current]
+    current_vibes = set(json.loads(current["vibe_filters"]) or json.loads(current["vibe_tags"]))
+    candidates = [member for member in waiting if member["user_id"] != user_id]
+    candidates.sort(
+        key=lambda member: (
+            -len(current_vibes.intersection(set(json.loads(member["vibe_filters"]) or json.loads(member["vibe_tags"])))),
+            member["queued_at"],
+        )
+    )
+    for candidate in candidates:
+        if len(group_members) >= 4:
+            break
+        if any(pair_is_blocked(db, candidate["user_id"], member["user_id"]) for member in group_members):
+            continue
+        if all(
+            distance_between_km(member["latitude"], member["longitude"], candidate["latitude"], candidate["longitude"])
+            <= GROUP_MATCHING_RADIUS_KM
+            for member in group_members
+        ):
+            group_members.append(candidate)
+    if len(group_members) < 3:
+        return None
+
+    group_id = str(uuid4())
+    created_at = now_iso()
+    db.execute("INSERT INTO group_rooms (id, created_at) VALUES (?, ?)", (group_id, created_at))
+    db.executemany(
+        "INSERT INTO group_members (group_id, user_id, joined_at) VALUES (?, ?, ?)",
+        [(group_id, member["user_id"], created_at) for member in group_members],
+    )
+    db.executemany("DELETE FROM match_queue WHERE user_id = ?", [(member["user_id"],) for member in group_members])
+    return db.execute("SELECT * FROM group_rooms WHERE id = ?", (group_id,)).fetchone()
+
+
 def serialize_asset(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -233,16 +438,58 @@ def serialize_asset(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def room_day(room: sqlite3.Row) -> int:
+    created = datetime.fromisoformat(room["created_at"])
+    return max(1, (datetime.now(timezone.utc) - created).days + 1)
+
+
+def serialize_daily_prompt(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> dict[str, Any]:
+    day = room_day(room)
+    partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
+    answers = db.execute(
+        """SELECT user_id, answer FROM daily_prompt_answers
+           WHERE room_id = ? AND prompt_day = ?""",
+        (room["id"], day),
+    ).fetchall()
+    answer_by_user = {row["user_id"]: row["answer"] for row in answers}
+    revealed = user_id in answer_by_user and partner_id in answer_by_user
+    return {
+        "day": day,
+        "question": DAILY_PROMPTS[(day - 1) % len(DAILY_PROMPTS)],
+        "my_answer": answer_by_user.get(user_id),
+        "partner_answer": answer_by_user.get(partner_id) if revealed else None,
+        "revealed": revealed,
+    }
+
+
+def serialize_room_message(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "author_id": row["author_id"],
+        "content": row["content"],
+        "created_at": row["created_at"],
+    }
+
+
+def serialize_group_message(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "author_id": row["author_id"],
+        "content": row["content"],
+        "created_at": row["created_at"],
+    }
+
+
 def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> dict[str, Any]:
     partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
     partner = db.execute(
-        """SELECT id, anonymous_handle, neighborhood_tag, verification_tier, is_demo
+        """SELECT id, anonymous_handle, neighborhood_tag, verification_tier, is_demo,
+              vibe_tags, last_seen_at, created_at
            FROM users WHERE id = ?""",
         (partner_id,),
     ).fetchone()
-    created = datetime.fromisoformat(room["created_at"])
-    days_elapsed = max(1, (datetime.now(timezone.utc) - created).days + 1)
-    unmask_day = get_setting(db, "unmask_day_threshold", 10)
+    days_elapsed = room_day(room)
+    unmask_day = get_setting(db, "unmask_day_threshold", 3)
     assets = db.execute(
         "SELECT * FROM assets WHERE room_id = ? ORDER BY created_at ASC", (room["id"],)
     ).fetchall()
@@ -251,6 +498,30 @@ def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> d
            WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
         (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
     ).fetchone()
+    prompt_days = db.execute(
+        """SELECT COUNT(*) AS count FROM (
+               SELECT prompt_day FROM daily_prompt_answers
+               WHERE room_id = ? GROUP BY prompt_day
+               HAVING COUNT(DISTINCT user_id) = 2
+           )""",
+        (room["id"],),
+    ).fetchone()["count"]
+    growth_stage = min(int(prompt_days), 3)
+    share_vote = room["user1_share_vote"] if room["user1_id"] == user_id else room["user2_share_vote"]
+    partner_vote = room["user2_share_vote"] if room["user1_id"] == user_id else room["user1_share_vote"]
+    shared_more = share_vote == 1 and partner_vote == 1
+    partner_last_seen = partner["last_seen_at"] or partner["created_at"] if partner else None
+    inactive_hours = 0
+    if partner and not partner["is_demo"] and partner_last_seen:
+        last_seen = datetime.fromisoformat(partner_last_seen)
+        inactive_hours = max(0, int((datetime.now(timezone.utc) - last_seen).total_seconds() // 3600))
+    partner_data = dict(partner) if partner else None
+    if partner_data:
+        partner_data.pop("vibe_tags", None)
+        partner_data.pop("last_seen_at", None)
+        partner_data.pop("created_at", None)
+        if shared_more:
+            partner_data["vibe_tags"] = json.loads(partner["vibe_tags"])
     return {
         "room_id": room["id"],
         "room_level": room["room_level"],
@@ -258,9 +529,22 @@ def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> d
         "days_elapsed": days_elapsed,
         "days_until_unmask": max(0, unmask_day - days_elapsed),
         "unmask_day_threshold": unmask_day,
+        "daily_prompt": serialize_daily_prompt(db, room, user_id),
+        "share_more": {
+            "available": days_elapsed >= SHARE_MORE_DAY,
+            "my_vote": share_vote,
+            "mutual": shared_more,
+            "partner_vibe_tags": json.loads(partner["vibe_tags"]) if shared_more and partner else [],
+        },
+        "plant_growth": {
+            "stage": growth_stage,
+            "completed_days": min(int(prompt_days), 3),
+        },
+        "partner_inactive_hours": inactive_hours if partner and not partner["is_demo"] else None,
+        "can_rematch": bool(partner and not partner["is_demo"] and inactive_hours >= REMATCH_AFTER_HOURS),
         "shared_state": json.loads(room["shared_state"]),
         "assets": [serialize_asset(asset) for asset in assets],
-        "partner": dict(partner) if partner else None,
+        "partner": partner_data,
         "demo_companion": bool(partner and partner["is_demo"]),
         "is_unmasked": friendship is not None,
         "friendship_id": friendship["id"] if friendship else None,
@@ -295,6 +579,28 @@ class AssetRequest(BaseModel):
     content: str | None = Field(default=None, max_length=140)
 
 
+class DailyPromptRequest(BaseModel):
+    day: int = Field(ge=1)
+    answer: str = Field(min_length=1, max_length=240)
+
+
+class ShareMoreRequest(BaseModel):
+    accept: bool
+
+
+class RoomMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=1000)
+
+
+class GroupBlockRequest(BaseModel):
+    blocked_user_id: str
+
+
+class GroupReportRequest(BaseModel):
+    reported_user_id: str
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class PolaroidUploadRequest(BaseModel):
     image_base64: str = Field(min_length=100, max_length=3_000_000)
     content_type: str = Field(pattern=r"^image/(jpeg|png|webp)$")
@@ -317,7 +623,7 @@ class ModerationAction(BaseModel):
 
 
 class AdminSettingsRequest(BaseModel):
-    matching_radius_km: int = Field(ge=1, le=25)
+    matching_radius_km: int = Field(ge=1, le=40)
     unmask_day_threshold: int = Field(ge=1, le=30)
 
 
@@ -470,68 +776,266 @@ async def find_companion(
         raise HTTPException(status_code=403, detail="User is outside the Pune geo-fence")
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
+        now_value = now_iso()
+        db.execute(
+            "UPDATE users SET latitude = ?, longitude = ?, last_seen_at = ? WHERE id = ?",
+            (payload.latitude, payload.longitude, now_value, user_id),
+        )
         user = db.execute(
-            "SELECT anonymous_handle, latitude, longitude, vibe_tags FROM users WHERE id = ?",
+            "SELECT anonymous_handle, latitude, longitude, vibe_tags, last_seen_at FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
         if not user or not user["anonymous_handle"] or user["latitude"] is None or user["longitude"] is None:
             raise HTTPException(status_code=409, detail="Complete your anonymous profile before matching")
         room = active_room_for_user(db, user_id)
         if room is not None:
+            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
             return serialize_room(db, room, user_id)
-        partner_id = str(uuid4())
-        offset = 0.008
-        partner_latitude = user["latitude"] + offset if user["latitude"] + offset <= max_lat else user["latitude"] - offset
-        partner_longitude = user["longitude"] + offset if user["longitude"] + offset <= max_lng else user["longitude"] - offset
-        latitude_delta = math.radians(user["latitude"] - partner_latitude)
-        longitude_delta = math.radians(user["longitude"] - partner_longitude)
-        haversine = math.sin(latitude_delta / 2) ** 2 + math.cos(math.radians(user["latitude"])) * math.cos(
-            math.radians(partner_latitude)
-        ) * math.sin(longitude_delta / 2) ** 2
-        distance_km = 6371 * 2 * math.asin(math.sqrt(haversine))
-        matching_radius = get_setting(db, "matching_radius_km", 5)
-        if distance_km > matching_radius:
-            raise HTTPException(status_code=404, detail="No companion is available within your matching radius")
-        room_id = str(uuid4())
+        group = active_group_for_user(db, user_id)
+        if group is not None:
+            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
+            return {"status": "group", "group": serialize_group(db, group, user_id)}
+        matching_radius = get_setting(db, "matching_radius_km", 40)
+        current_vibes = set(payload.vibe_filters or json.loads(user["vibe_tags"]))
+        now = datetime.now(timezone.utc)
+        queue_cutoff = (now - timedelta(minutes=MATCH_QUEUE_TTL_MINUTES)).isoformat()
+        active_cutoff = (now - timedelta(minutes=MATCH_USER_ACTIVE_MINUTES)).isoformat()
+        db.execute("DELETE FROM match_queue WHERE queued_at < ?", (queue_cutoff,))
         db.execute(
-            """INSERT INTO users
-               (id, phone_number, anonymous_handle, neighborhood_tag, latitude, longitude,
-                verification_tier, is_demo, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'demo', 1, ?)""",
-            (
-                partner_id,
-                f"demo+{partner_id}@parallel-lives.invalid",
-                f"cinder{partner_id[:4]}",
-                "Baner",
-                partner_latitude,
-                partner_longitude,
-                now_iso(),
-            ),
+            """DELETE FROM match_queue WHERE user_id IN (
+                   SELECT id FROM users WHERE last_seen_at IS NULL OR last_seen_at < ?
+               )""",
+            (active_cutoff,),
         )
+        db.execute(
+            """INSERT INTO match_queue (user_id, vibe_filters, queued_at) VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET vibe_filters = excluded.vibe_filters""",
+            (user_id, json.dumps(sorted(current_vibes)), now_value),
+        )
+        group = create_group_from_queue(db, user_id)
+        if group is not None:
+            return {"status": "group", "group": serialize_group(db, group, user_id)}
+        candidates = db.execute(
+            """SELECT q.user_id, q.vibe_filters AS queued_vibes, q.queued_at,
+                      u.latitude, u.longitude, u.vibe_tags
+               FROM match_queue q JOIN users u ON u.id = q.user_id
+               WHERE q.user_id != ? AND u.is_demo = 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM rooms r WHERE r.status = 'active'
+                       AND (r.user1_id = q.user_id OR r.user2_id = q.user_id)
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM group_members gm JOIN group_rooms gr ON gr.id = gm.group_id
+                     WHERE gm.user_id = q.user_id AND gm.left_at IS NULL AND gr.status = 'active'
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM blocks b WHERE
+                       (b.blocker_id = ? AND b.blocked_user_id = q.user_id)
+                       OR (b.blocker_id = q.user_id AND b.blocked_user_id = ?)
+                 )""",
+            (user_id, user_id, user_id),
+        ).fetchall()
+        ranked_candidates: list[tuple[int, float, str, sqlite3.Row, list[str]]] = []
+        for candidate in candidates:
+            latitude_delta = math.radians(user["latitude"] - candidate["latitude"])
+            longitude_delta = math.radians(user["longitude"] - candidate["longitude"])
+            haversine = math.sin(latitude_delta / 2) ** 2 + math.cos(math.radians(user["latitude"])) * math.cos(
+                math.radians(candidate["latitude"])
+            ) * math.sin(longitude_delta / 2) ** 2
+            distance_km = 6371 * 2 * math.asin(math.sqrt(haversine))
+            if distance_km > matching_radius:
+                continue
+            candidate_vibes = set(json.loads(candidate["queued_vibes"]) or json.loads(candidate["vibe_tags"]))
+            shared_vibes = sorted(current_vibes.intersection(candidate_vibes))
+            ranked_candidates.append((-len(shared_vibes), distance_km, candidate["queued_at"], candidate, shared_vibes))
+        if not ranked_candidates:
+            queue_entry = db.execute(
+                "SELECT queued_at FROM match_queue WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return {"status": "waiting", "queued_at": queue_entry["queued_at"]}
+        _, distance_km, _, candidate, shared_vibes = min(ranked_candidates, key=lambda item: item[:3])
+        partner_id = candidate["user_id"]
+        room_id = str(uuid4())
         db.execute(
             "INSERT INTO rooms (id, user1_id, user2_id, shared_state, created_at) VALUES (?, ?, ?, ?, ?)",
             (
                 room_id,
-                user_id,
                 partner_id,
-                json.dumps({"plant_health": 86, "active_track": None, "theme": "sunset"}),
+                user_id,
+                json.dumps({"plant_health": 100, "active_track": None, "theme": "sunset"}),
                 now_iso(),
             ),
         )
-        db.execute(
-            """INSERT INTO assets (id, room_id, author_id, asset_type, content, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (str(uuid4()), room_id, partner_id, "sticky_note", "A quiet room is still a room.", now_iso()),
-        )
+        db.execute("DELETE FROM match_queue WHERE user_id IN (?, ?)", (user_id, partner_id))
         room = db.execute("SELECT * FROM rooms WHERE id = ?", (room_id,)).fetchone()
         result = serialize_room(db, room, user_id)
         result["match"] = {
             "distance_km": round(distance_km, 1),
-            "vibe_match": payload.vibe_filters or json.loads(user["vibe_tags"]),
-            "demo_companion": True,
+            "vibe_match": shared_vibes,
+            "demo_companion": False,
         }
+        result["match_status"] = "matched"
     await manager.broadcast(room_id, room_payload(room_id, "state_sync", {"kind": "room_created"}))
     return result
+
+
+@app.get("/api/v1/match/status")
+def get_match_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        room = active_room_for_user(db, user_id)
+        if room is not None:
+            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
+            return {"status": "matched", "room": serialize_room(db, room, user_id)}
+        group = active_group_for_user(db, user_id)
+        if group is not None:
+            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
+            return {"status": "group", "group": serialize_group(db, group, user_id)}
+        queued = db.execute(
+            "SELECT queued_at FROM match_queue WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if queued is None:
+            return {"status": "idle"}
+        now = datetime.now(timezone.utc)
+        queue_age = now - datetime.fromisoformat(queued["queued_at"])
+        user = db.execute("SELECT last_seen_at FROM users WHERE id = ?", (user_id,)).fetchone()
+        last_seen = datetime.fromisoformat(user["last_seen_at"]) if user and user["last_seen_at"] else None
+        if queue_age > timedelta(minutes=MATCH_QUEUE_TTL_MINUTES) or last_seen is None or now - last_seen > timedelta(minutes=MATCH_USER_ACTIVE_MINUTES):
+            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
+            return {"status": "idle"}
+        group = create_group_from_queue(db, user_id)
+        if group is not None:
+            return {"status": "group", "group": serialize_group(db, group, user_id)}
+        return {"status": "waiting", "queued_at": queued["queued_at"]}
+
+
+@app.delete("/api/v1/match/queue")
+def cancel_match_search(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        room = active_room_for_user(db, user_id)
+        if room is not None:
+            return {"status": "matched"}
+        group = active_group_for_user(db, user_id)
+        if group is not None:
+            return {"status": "group"}
+        db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
+    return {"status": "cancelled"}
+
+
+@app.get("/api/v1/group/messages")
+def get_group_messages(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        group = active_group_for_user(db, user_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="You do not have an active group")
+        rows = db.execute(
+            "SELECT * FROM group_messages WHERE group_id = ? ORDER BY created_at DESC LIMIT 100",
+            (group["id"],),
+        ).fetchall()
+        return {"messages": [serialize_group_message(row) for row in reversed(rows)]}
+
+
+@app.post("/api/v1/group/messages")
+def create_group_message(
+    payload: RoomMessageRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    ensure_user_can_interact(user_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Write a message before sending")
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        group = active_group_for_user(db, user_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="You do not have an active group")
+        message_id = str(uuid4())
+        db.execute(
+            "INSERT INTO group_messages (id, group_id, author_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (message_id, group["id"], user_id, content, now_iso()),
+        )
+        message = serialize_group_message(
+            db.execute("SELECT * FROM group_messages WHERE id = ?", (message_id,)).fetchone()
+        )
+    return {"message": message}
+
+
+@app.post("/api/v1/group/leave")
+def leave_group(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        group = active_group_for_user(db, user_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="You do not have an active group")
+        db.execute(
+            "UPDATE group_members SET left_at = ? WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
+            (now_iso(), group["id"], user_id),
+        )
+        remaining = db.execute(
+            "SELECT COUNT(*) AS count FROM group_members WHERE group_id = ? AND left_at IS NULL",
+            (group["id"],),
+        ).fetchone()["count"]
+        if remaining < 2:
+            db.execute("UPDATE group_rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?", (now_iso(), group["id"]))
+    return {"status": "left", "group_id": group["id"]}
+
+
+@app.post("/api/v1/group/block")
+def block_group_member(
+    payload: GroupBlockRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        group = active_group_for_user(db, user_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="You do not have an active group")
+        member = db.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
+            (group["id"], payload.blocked_user_id),
+        ).fetchone()
+        if member is None or payload.blocked_user_id == user_id:
+            raise HTTPException(status_code=404, detail="Group member not found")
+        db.execute(
+            "INSERT OR IGNORE INTO blocks (blocker_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
+            (user_id, payload.blocked_user_id, now_iso()),
+        )
+        db.execute(
+            "UPDATE group_members SET left_at = ? WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
+            (now_iso(), group["id"], user_id),
+        )
+    return {"status": "blocked_and_left", "group_id": group["id"]}
+
+
+@app.post("/api/v1/group/report")
+def report_group_member(
+    payload: GroupReportRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        group = active_group_for_user(db, user_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="You do not have an active group")
+        member = db.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
+            (group["id"], payload.reported_user_id),
+        ).fetchone()
+        if member is None or payload.reported_user_id == user_id:
+            raise HTTPException(status_code=404, detail="Group member not found")
+        report_id = str(uuid4())
+        db.execute(
+            "INSERT INTO reports (id, room_id, reporter_id, reported_user_id, reason, created_at) VALUES (?, NULL, ?, ?, ?, ?)",
+            (report_id, user_id, payload.reported_user_id, payload.reason.strip(), now_iso()),
+        )
+    return {"status": "reported", "report_id": report_id}
 
 
 @app.get("/api/v1/room/active")
@@ -543,6 +1047,159 @@ def get_active_room(authorization: str | None = Header(default=None)) -> dict[st
         if room is None:
             raise HTTPException(status_code=404, detail="You do not have an active room")
         return serialize_room(db, room, user_id)
+
+
+@app.get("/api/v1/room/messages")
+def get_room_messages(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        room = active_room_for_user(db, user_id)
+        if room is None:
+            raise HTTPException(status_code=404, detail="You do not have an active room")
+        rows = db.execute(
+            "SELECT * FROM room_messages WHERE room_id = ? ORDER BY created_at DESC LIMIT 100",
+            (room["id"],),
+        ).fetchall()
+        return {"messages": [serialize_room_message(row) for row in reversed(rows)]}
+
+
+@app.post("/api/v1/room/messages")
+async def create_room_message(
+    payload: RoomMessageRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    ensure_user_can_interact(user_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Write a message before sending")
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        room = active_room_for_user(db, user_id)
+        if room is None:
+            raise HTTPException(status_code=404, detail="You do not have an active room")
+        recent_count = db.execute(
+            """SELECT COUNT(*) AS count FROM room_messages
+               WHERE room_id = ? AND author_id = ? AND created_at >= ?""",
+            (room["id"], user_id, (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()),
+        ).fetchone()["count"]
+        if recent_count >= ROOM_MESSAGE_LIMIT_PER_HOUR:
+            raise HTTPException(status_code=429, detail="You have sent a lot of messages. Try again in a little while.")
+        message_id = str(uuid4())
+        created_at = now_iso()
+        db.execute(
+            "INSERT INTO room_messages (id, room_id, author_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (message_id, room["id"], user_id, content, created_at),
+        )
+        message_row = db.execute("SELECT * FROM room_messages WHERE id = ?", (message_id,)).fetchone()
+        message = serialize_room_message(message_row)
+    await manager.broadcast(room["id"], room_payload(room["id"], "room_message", message))
+    return {"message": message}
+
+
+@app.post("/api/v1/room/share-more")
+async def share_more(
+    payload: ShareMoreRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    ensure_user_can_interact(user_id)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        room = active_room_for_user(db, user_id)
+        if room is None:
+            raise HTTPException(status_code=404, detail="You do not have an active room")
+        if room_day(room) < SHARE_MORE_DAY:
+            raise HTTPException(status_code=409, detail="Sharing more opens on day 3")
+        column = "user1_share_vote" if room["user1_id"] == user_id else "user2_share_vote"
+        db.execute(f"UPDATE rooms SET {column} = ? WHERE id = ?", (int(payload.accept), room["id"]))
+        partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
+        partner = db.execute("SELECT is_demo FROM users WHERE id = ?", (partner_id,)).fetchone()
+        if payload.accept and partner and partner["is_demo"]:
+            other_column = "user2_share_vote" if room["user1_id"] == user_id else "user1_share_vote"
+            db.execute(f"UPDATE rooms SET {other_column} = 1 WHERE id = ?", (room["id"],))
+        updated = db.execute("SELECT * FROM rooms WHERE id = ?", (room["id"],)).fetchone()
+        result: dict[str, Any] = {"share_more": serialize_room(db, updated, user_id)["share_more"]}
+        if payload.accept and updated["user1_share_vote"] == 1 and updated["user2_share_vote"] == 1:
+            friendship_id = str(uuid4())
+            db.execute(
+                """INSERT OR IGNORE INTO friendships
+                   (id, user1_id, user2_id, archived_room_snapshot, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    friendship_id,
+                    room["user1_id"],
+                    room["user2_id"],
+                    json.dumps({"room_id": room["id"], "shared_state": json.loads(room["shared_state"])}),
+                    now_iso(),
+                ),
+            )
+            friendship = db.execute(
+                """SELECT id FROM friendships
+                   WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
+                (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
+            ).fetchone()
+            if friendship:
+                db.execute(
+                    """INSERT OR IGNORE INTO messages (id, friendship_id, author_id, content, created_at)
+                       SELECT id, ?, author_id, content, created_at FROM room_messages WHERE room_id = ?""",
+                    (friendship["id"], room["id"]),
+                )
+            db.execute("UPDATE rooms SET status = 'graduated' WHERE id = ?", (room["id"],))
+            result.update({"status": "graduated", "friendship_id": friendship["id"] if friendship else None})
+        else:
+            result["status"] = "waiting_for_partner" if payload.accept else "still_anonymous"
+    event = "unmask_updated" if result["status"] == "graduated" else "share_more_updated"
+    await manager.broadcast(room["id"], room_payload(room["id"], event, result))
+    return result
+
+
+@app.post("/api/v1/room/daily-prompt")
+async def answer_daily_prompt(
+    payload: DailyPromptRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    ensure_user_can_interact(user_id)
+    if not payload.answer.strip():
+        raise HTTPException(status_code=422, detail="Write a short answer before sharing")
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        room = active_room_for_user(db, user_id)
+        if room is None:
+            raise HTTPException(status_code=404, detail="You do not have an active room")
+        day = room_day(room)
+        if payload.day != day:
+            raise HTTPException(status_code=409, detail="Today’s prompt changed; refresh your room")
+        existing = db.execute(
+            """SELECT 1 FROM daily_prompt_answers
+               WHERE room_id = ? AND user_id = ? AND prompt_day = ?""",
+            (room["id"], user_id, day),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="You have already answered today’s prompt")
+        db.execute(
+            """INSERT INTO daily_prompt_answers
+               (room_id, user_id, prompt_day, answer, created_at) VALUES (?, ?, ?, ?, ?)""",
+            (room["id"], user_id, day, payload.answer.strip(), now_iso()),
+        )
+        partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
+        partner = db.execute("SELECT is_demo FROM users WHERE id = ?", (partner_id,)).fetchone()
+        if partner and partner["is_demo"]:
+            db.execute(
+                """INSERT OR IGNORE INTO daily_prompt_answers
+                   (room_id, user_id, prompt_day, answer, created_at) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    room["id"],
+                    partner_id,
+                    day,
+                    DEMO_PROMPT_ANSWERS[(day - 1) % len(DEMO_PROMPT_ANSWERS)],
+                    now_iso(),
+                ),
+            )
+        result = serialize_daily_prompt(db, room, user_id)
+    await manager.broadcast(room["id"], room_payload(room["id"], "daily_prompt_updated", {}))
+    return {"daily_prompt": result}
 
 
 @app.post("/api/v1/room/asset")
@@ -692,6 +1349,27 @@ async def dissolve_room(authorization: str | None = Header(default=None)) -> dic
     return {"status": "dissolved", "room_id": room["id"]}
 
 
+@app.post("/api/v1/room/block")
+async def block_room_partner(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    user_id = get_user_id(authorization)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        room = active_room_for_user(db, user_id)
+        if room is None:
+            raise HTTPException(status_code=404, detail="You do not have an active room")
+        partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
+        db.execute(
+            "INSERT OR IGNORE INTO blocks (blocker_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
+            (user_id, partner_id, now_iso()),
+        )
+        db.execute(
+            "UPDATE rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?",
+            (now_iso(), room["id"]),
+        )
+    await manager.broadcast(room["id"], room_payload(room["id"], "room_dissolved", {"blocked": True}))
+    return {"status": "blocked", "room_id": room["id"]}
+
+
 @app.post("/api/v1/room/unmask-opt-in")
 async def unmask_opt_in(
     payload: UnmaskRequest, authorization: str | None = Header(default=None)
@@ -704,7 +1382,7 @@ async def unmask_opt_in(
             raise HTTPException(status_code=404, detail="You do not have an active room")
         if payload.accept:
             elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(room["created_at"])).days + 1
-            unmask_day = get_setting(db, "unmask_day_threshold", 10)
+            unmask_day = get_setting(db, "unmask_day_threshold", 3)
             if elapsed < unmask_day:
                 raise HTTPException(
                     status_code=409,
@@ -740,6 +1418,17 @@ async def unmask_opt_in(
                     now_iso(),
                 ),
             )
+            friendship = db.execute(
+                """SELECT id FROM friendships
+                   WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
+                (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
+            ).fetchone()
+            if friendship:
+                db.execute(
+                    """INSERT OR IGNORE INTO messages (id, friendship_id, author_id, content, created_at)
+                       SELECT id, ?, author_id, content, created_at FROM room_messages WHERE room_id = ?""",
+                    (friendship["id"], room["id"]),
+                )
             db.execute(
                 "UPDATE rooms SET status = 'graduated' WHERE id = ?", (room["id"],)
             )
@@ -867,6 +1556,27 @@ def admin_overview(x_admin_token: str | None = Header(default=None)) -> dict[str
         active = db.execute("SELECT COUNT(*) AS count FROM rooms WHERE status = 'active'").fetchone()["count"]
         graduated = db.execute("SELECT COUNT(*) AS count FROM friendships").fetchone()["count"]
         open_reports = db.execute("SELECT COUNT(*) AS count FROM reports WHERE status = 'open'").fetchone()["count"]
+        active_groups = db.execute("SELECT COUNT(*) AS count FROM group_rooms WHERE status = 'active'").fetchone()["count"]
+        two_way_chats = db.execute(
+            """SELECT COUNT(*) AS count FROM (
+                   SELECT conversation_type, conversation_id FROM (
+                       SELECT 'room' AS conversation_type, m.room_id AS conversation_id, m.author_id
+                       FROM room_messages m JOIN users u ON u.id = m.author_id WHERE u.is_demo = 0
+                       UNION ALL
+                       SELECT 'group' AS conversation_type, m.group_id AS conversation_id, m.author_id
+                       FROM group_messages m JOIN users u ON u.id = m.author_id WHERE u.is_demo = 0
+                   ) GROUP BY conversation_type, conversation_id
+                   HAVING COUNT(DISTINCT author_id) >= 2
+               )"""
+        ).fetchone()["count"]
+        mutual_prompt_days = db.execute(
+            """SELECT COUNT(*) AS count FROM (
+                   SELECT a.room_id, a.prompt_day FROM daily_prompt_answers a
+                   JOIN users u ON u.id = a.user_id WHERE u.is_demo = 0
+                   GROUP BY a.room_id, a.prompt_day
+                   HAVING COUNT(DISTINCT a.user_id) >= 2
+               )"""
+        ).fetchone()["count"]
         areas = db.execute(
             """SELECT neighborhood_tag AS neighborhood, COUNT(*) AS users
                FROM users WHERE is_demo = 0 AND neighborhood_tag != ''
@@ -875,8 +1585,11 @@ def admin_overview(x_admin_token: str | None = Header(default=None)) -> dict[str
         return {
             "users": users,
             "active_rooms": active,
+            "active_groups": active_groups,
             "graduated_friendships": graduated,
             "open_reports": open_reports,
+            "two_way_chats": two_way_chats,
+            "mutual_prompt_days": mutual_prompt_days,
             "neighborhoods": [dict(row) for row in areas],
         }
 
@@ -924,6 +1637,13 @@ async def moderate_report(
                 """UPDATE rooms SET status = 'dissolved', dissolved_at = ?
                    WHERE status = 'active' AND (user1_id = ? OR user2_id = ?)""",
                 (now_iso(), report["reported_user_id"], report["reported_user_id"]),
+            )
+            db.execute(
+                """UPDATE group_rooms SET status = 'dissolved', dissolved_at = ?
+                   WHERE status = 'active' AND id IN (
+                       SELECT group_id FROM group_members WHERE user_id = ? AND left_at IS NULL
+                   )""",
+                (now_iso(), report["reported_user_id"]),
             )
         elif action == "shadow_ban":
             db.execute("UPDATE users SET is_shadow_banned = 1 WHERE id = ?", (report["reported_user_id"],))
@@ -1013,6 +1733,13 @@ async def admin_user_action(
                        WHERE status = 'active' AND (user1_id = ? OR user2_id = ?)""",
                     (now_iso(), user_id, user_id),
                 )
+                db.execute(
+                    """UPDATE group_rooms SET status = 'dissolved', dissolved_at = ?
+                       WHERE status = 'active' AND id IN (
+                           SELECT group_id FROM group_members WHERE user_id = ? AND left_at IS NULL
+                       )""",
+                    (now_iso(), user_id),
+                )
     for room_id in room_ids:
         await manager.broadcast(
             room_id,
@@ -1026,8 +1753,8 @@ def admin_settings(x_admin_token: str | None = Header(default=None)) -> dict[str
     require_admin(x_admin_token)
     with database() as db:
         return {
-            "matching_radius_km": get_setting(db, "matching_radius_km", 5),
-            "unmask_day_threshold": get_setting(db, "unmask_day_threshold", 10),
+            "matching_radius_km": get_setting(db, "matching_radius_km", 40),
+            "unmask_day_threshold": get_setting(db, "unmask_day_threshold", 3),
         }
 
 
@@ -1045,6 +1772,37 @@ def admin_rooms(x_admin_token: str | None = Header(default=None)) -> dict[str, A
                WHERE r.status = 'active' ORDER BY r.created_at"""
         ).fetchall()
         return {"rooms": [dict(row) for row in rooms]}
+
+
+@app.get("/api/v1/admin/groups")
+def admin_groups(x_admin_token: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(x_admin_token)
+    with database() as db:
+        groups = db.execute(
+            """SELECT g.id AS group_id, g.created_at, COUNT(m.user_id) AS member_count,
+                      GROUP_CONCAT(u.anonymous_handle, ', ') AS member_handles
+               FROM group_rooms g JOIN group_members m ON m.group_id = g.id
+               JOIN users u ON u.id = m.user_id
+               WHERE g.status = 'active' AND m.left_at IS NULL
+               GROUP BY g.id ORDER BY g.created_at"""
+        ).fetchall()
+        return {"groups": [dict(row) for row in groups]}
+
+
+@app.post("/api/v1/admin/groups/{group_id}/dissolve")
+def admin_dissolve_group(
+    group_id: str,
+    x_admin_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    require_admin(x_admin_token)
+    with database() as db:
+        cursor = db.execute(
+            "UPDATE group_rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ? AND status = 'active'",
+            (now_iso(), group_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Active group not found")
+    return {"status": "dissolved", "group_id": group_id}
 
 
 @app.put("/api/v1/admin/settings")
@@ -1095,11 +1853,13 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
         await websocket.close(code=1008, reason="Unauthorized or inactive room")
         return
     await manager.connect(room_id, websocket)
-    await manager.broadcast(room_id, room_payload(room_id, "presence_glow", {"online": True}))
+    await manager.broadcast(room_id, room_payload(room_id, "presence_glow", {"online": True, "from": user_id}))
     try:
         while True:
             event = await websocket.receive_json()
             event_type = event.get("event")
+            with database() as db:
+                db.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", (now_iso(), user_id))
             if event_type == "haptic_nudge":
                 try:
                     ensure_user_can_interact(user_id)
@@ -1123,6 +1883,26 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     state["active_track"] = track or None
                     db.execute("UPDATE rooms SET shared_state = ? WHERE id = ?", (json.dumps(state), room_id))
                 await manager.broadcast(room_id, room_payload(room_id, "state_sync", {"active_track": track}))
+            elif event_type == "update_room_ambience":
+                try:
+                    ensure_user_can_interact(user_id)
+                except HTTPException as exc:
+                    await websocket.send_json(room_payload(room_id, "error", {"message": exc.detail}))
+                    continue
+                ambience_id = str(event.get("ambience_id", ""))
+                if ambience_id not in ROOM_AMBIENCE_IDS:
+                    await websocket.send_json(room_payload(room_id, "error", {"message": "Unknown room ambience"}))
+                    continue
+                with database() as db:
+                    room = get_room(db, room_id, user_id)
+                    state = json.loads(room["shared_state"])
+                    state["ambience_id"] = ambience_id
+                    state["theme"] = ambience_id
+                    db.execute("UPDATE rooms SET shared_state = ? WHERE id = ?", (json.dumps(state), room_id))
+                await manager.broadcast(
+                    room_id,
+                    room_payload(room_id, "state_sync", {"ambience_id": ambience_id, "theme": ambience_id}),
+                )
             elif event_type == "presence":
                 await manager.broadcast(
                     room_id,
@@ -1132,4 +1912,4 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                 await websocket.send_json(room_payload(room_id, "error", {"message": "Unsupported room event"}))
     except WebSocketDisconnect:
         await manager.disconnect(room_id, websocket)
-        await manager.broadcast(room_id, room_payload(room_id, "presence_glow", {"online": False}))
+        await manager.broadcast(room_id, room_payload(room_id, "presence_glow", {"online": False, "from": user_id}))

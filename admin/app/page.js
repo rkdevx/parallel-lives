@@ -17,7 +17,8 @@ export default function Page() {
   const [reports, setReports] = useState([]);
   const [users, setUsers] = useState([]);
   const [rooms, setRooms] = useState([]);
-  const [settings, setSettings] = useState({ matching_radius_km: 5, unmask_day_threshold: 10 });
+  const [groups, setGroups] = useState([]);
+  const [settings, setSettings] = useState({ matching_radius_km: 40, unmask_day_threshold: 10 });
   const [userSearch, setUserSearch] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -28,27 +29,31 @@ export default function Page() {
     setError('');
     try {
       const headers = { 'X-Admin-Token': token };
-      const [overviewResponse, reportsResponse, usersResponse, roomsResponse, settingsResponse] = await Promise.all([
+      const [overviewResponse, reportsResponse, usersResponse, roomsResponse, groupsResponse, settingsResponse] = await Promise.all([
         fetch(`${API_URL}/api/v1/admin/overview`, { headers }),
         fetch(`${API_URL}/api/v1/admin/reports`, { headers }),
         fetch(`${API_URL}/api/v1/admin/users`, { headers }),
         fetch(`${API_URL}/api/v1/admin/rooms`, { headers }),
+        fetch(`${API_URL}/api/v1/admin/groups`, { headers }),
         fetch(`${API_URL}/api/v1/admin/settings`, { headers }),
       ]);
       const overviewData = await overviewResponse.json();
       const reportData = await reportsResponse.json();
       const usersData = await usersResponse.json();
       const roomsData = await roomsResponse.json();
+      const groupsData = await groupsResponse.json();
       const settingsData = await settingsResponse.json();
       if (!overviewResponse.ok) throw new Error(apiError(overviewData, 'Could not load dashboard.'));
       if (!reportsResponse.ok) throw new Error(apiError(reportData, 'Could not load moderation reports.'));
       if (!usersResponse.ok) throw new Error(apiError(usersData, 'Could not load users.'));
       if (!roomsResponse.ok) throw new Error(apiError(roomsData, 'Could not load active rooms.'));
+      if (!groupsResponse.ok) throw new Error(apiError(groupsData, 'Could not load active groups.'));
       if (!settingsResponse.ok) throw new Error(apiError(settingsData, 'Could not load system settings.'));
       setOverview(overviewData);
       setReports(reportData.reports);
       setUsers(usersData.users);
       setRooms(roomsData.rooms);
+      setGroups(groupsData.groups);
       setSettings(settingsData);
       setAdminToken(token);
       localStorage.setItem(TOKEN_KEY, token);
@@ -162,6 +167,26 @@ export default function Page() {
     }
   };
 
+  const dissolveGroup = async (groupId) => {
+    if (!window.confirm('Dissolve this group room for everyone?')) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const response = await fetch(`${API_URL}/api/v1/admin/groups/${groupId}/dissolve`, {
+        method: 'POST',
+        headers: { 'X-Admin-Token': adminToken },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(apiError(result, 'Could not dissolve group.'));
+      setNotice('Group dissolved and its active matching slots released.');
+      await loadDashboard(adminToken);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not dissolve group.');
+      setBusy(false);
+    }
+  };
+
   useEffect(() => {
     const saved = localStorage.getItem(TOKEN_KEY);
     if (saved) loadDashboard(saved);
@@ -223,8 +248,11 @@ export default function Page() {
             {[
               ['Community members', overview.users, 'Accounts created'],
               ['Active rooms', overview.active_rooms, 'Incubations in progress'],
+              ['Active small groups', overview.active_groups, 'Nearby fallback circles'],
               ['Graduated circles', overview.graduated_friendships, 'Mutual day-10 opt-ins'],
               ['Open safety reports', overview.open_reports, 'Awaiting review'],
+              ['Two-way chats', overview.two_way_chats, 'Real users who have both replied'],
+              ['Mutual ritual days', overview.mutual_prompt_days, 'Daily prompts completed by both'],
             ].map(([label, value, detail]) => (
               <article className="card stat" key={label}>
                 <span>{label}</span><strong>{value}</strong><small>{detail}</small>
@@ -318,12 +346,25 @@ export default function Page() {
                 ))}
                 {!rooms.length && <p className="empty">There are no active rooms.</p>}
               </div>
+              <div className="section-head group-list-head">
+                <div><p className="eyebrow">GROUP FALLBACK</p><h2>Small circles</h2></div>
+                <span className="count">{groups.length} active</span>
+              </div>
+              <div className="report-list">
+                {groups.map((group) => (
+                  <div className="room-row" key={group.group_id}>
+                    <div><strong>{group.member_handles}</strong><small>{group.member_count} people · Group {group.group_id.slice(0, 8)}</small></div>
+                    <button className="button danger" disabled={busy} onClick={() => dissolveGroup(group.group_id)}>Dissolve</button>
+                  </div>
+                ))}
+                {!groups.length && <p className="empty">No active small groups.</p>}
+              </div>
             </article>
           </section>
           <section className="card config-card">
-            <div><p className="eyebrow">SYSTEM CONFIGURATION</p><h2>Matching and graduation</h2><p className="hint">Matching radius is capped at 25 km. The incubation milestone controls when mutual opt-in opens.</p></div>
+            <div><p className="eyebrow">SYSTEM CONFIGURATION</p><h2>Matching and graduation</h2><p className="hint">Matching radius is capped at 40 km. The incubation milestone controls when mutual opt-in opens.</p></div>
             <form className="settings-form" onSubmit={saveSettings}>
-              <label>Matching radius (km)<input type="number" min="1" max="25" value={settings.matching_radius_km} onChange={(event) => setSettings({ ...settings, matching_radius_km: event.target.value })} /></label>
+              <label>Matching radius (km)<input type="number" min="1" max="40" value={settings.matching_radius_km} onChange={(event) => setSettings({ ...settings, matching_radius_km: event.target.value })} /></label>
               <label>Unmask day<input type="number" min="1" max="30" value={settings.unmask_day_threshold} onChange={(event) => setSettings({ ...settings, unmask_day_threshold: event.target.value })} /></label>
               <button className="button primary" disabled={busy}>Save settings</button>
             </form>

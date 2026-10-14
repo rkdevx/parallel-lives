@@ -2,6 +2,7 @@
   "expo": {
     "name": "Parallel Lives",
     "slug": "parallel-lives",
+    "scheme": "parallel-lives-login",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
@@ -15,7 +16,10 @@
           "photosPermission": "Choose a photo to add to your shared room."
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-audio",
+      "expo-web-browser",
+      "expo-secure-store"
     ],
     "ios": {
       "supportsTablet": true,

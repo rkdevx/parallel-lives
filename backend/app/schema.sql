@@ -15,6 +15,7 @@ CREATE TABLE users (
     is_banned BOOLEAN NOT NULL DEFAULT FALSE,
     is_shadow_banned BOOLEAN NOT NULL DEFAULT FALSE,
     is_muted BOOLEAN NOT NULL DEFAULT FALSE,
+    last_seen_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -27,17 +28,48 @@ CREATE TABLE sessions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE match_queue (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    vibe_filters JSONB NOT NULL DEFAULT '[]'::jsonb,
+    queued_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE group_rooms (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'dissolved')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    dissolved_at TIMESTAMPTZ
+);
+
+CREATE TABLE group_members (
+    group_id UUID NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    left_at TIMESTAMPTZ,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE INDEX idx_active_group_members_user ON group_members(user_id, left_at);
+
+CREATE TABLE group_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    group_id UUID NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
+    author_id UUID NOT NULL REFERENCES users(id),
+    content VARCHAR(1000) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_group_messages_group_created ON group_messages(group_id, created_at);
+
 CREATE TABLE app_settings (
     setting_key VARCHAR(40) PRIMARY KEY,
     setting_value INTEGER NOT NULL,
     CHECK (
-        (setting_key = 'matching_radius_km' AND setting_value BETWEEN 1 AND 25)
+        (setting_key = 'matching_radius_km' AND setting_value BETWEEN 1 AND 40)
         OR (setting_key = 'unmask_day_threshold' AND setting_value BETWEEN 1 AND 30)
     )
 );
 INSERT INTO app_settings (setting_key, setting_value) VALUES
-    ('matching_radius_km', 5),
-    ('unmask_day_threshold', 10);
+    ('matching_radius_km', 40),
+    ('unmask_day_threshold', 3);
 
 CREATE TABLE active_rooms (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -50,6 +82,8 @@ CREATE TABLE active_rooms (
         CHECK (status IN ('active', 'dissolved', 'graduated')),
     user1_vote BOOLEAN,
     user2_vote BOOLEAN,
+    user1_share_vote BOOLEAN,
+    user2_share_vote BOOLEAN,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     dissolved_at TIMESTAMPTZ,
     CHECK (user1_id <> user2_id)
@@ -106,6 +140,32 @@ CREATE TABLE daily_actions (
     action_date DATE NOT NULL DEFAULT CURRENT_DATE,
     action VARCHAR(40) NOT NULL,
     PRIMARY KEY (room_id, user_id, action_date, action)
+);
+
+CREATE TABLE daily_prompt_answers (
+    room_id UUID NOT NULL REFERENCES active_rooms(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id),
+    prompt_day INTEGER NOT NULL CHECK (prompt_day > 0),
+    answer VARCHAR(240) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (room_id, user_id, prompt_day)
+);
+
+CREATE TABLE room_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id UUID NOT NULL REFERENCES active_rooms(id) ON DELETE CASCADE,
+    author_id UUID NOT NULL REFERENCES users(id),
+    content VARCHAR(1000) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_room_messages_room_created ON room_messages(room_id, created_at);
+
+CREATE TABLE blocks (
+    blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    blocked_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (blocker_id, blocked_user_id),
+    CHECK (blocker_id <> blocked_user_id)
 );
 
 CREATE TABLE friendships (
