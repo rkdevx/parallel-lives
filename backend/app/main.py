@@ -43,24 +43,12 @@ DEMO_PROMPT_ANSWERS = (
     "The light changing in the room around sunset.",
 )
 SHARE_MORE_DAY = 3
+SHARE_MORE_REPLY_HOURS = 24
+CONTINUE_WORLD_WINDOW_DAYS = 7
 REMATCH_AFTER_HOURS = 24
 ROOM_MESSAGE_LIMIT_PER_HOUR = 60
-ROOM_AMBIENCE_IDS = {
-    "room-tone",
-    "rain-on-glass",
-    "river-walk",
-    "morning-birds",
-    "wind-in-leaves",
-    "ocean-hush",
-    "night-crickets",
-    "cafe-window",
-    "forest-dawn",
-    "soft-fireplace",
-}
 MATCH_QUEUE_TTL_MINUTES = 10
 MATCH_USER_ACTIVE_MINUTES = 2
-GROUP_FALLBACK_AFTER_SECONDS = 120
-GROUP_MATCHING_RADIUS_KM = 40
 
 
 @asynccontextmanager
@@ -129,30 +117,6 @@ def initialize_database() -> None:
                 vibe_filters TEXT NOT NULL DEFAULT '[]',
                 queued_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS group_rooms (
-                id TEXT PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                dissolved_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS group_members (
-                group_id TEXT NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
-                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                joined_at TEXT NOT NULL,
-                left_at TEXT,
-                PRIMARY KEY (group_id, user_id)
-            );
-            CREATE INDEX IF NOT EXISTS active_group_members_by_user
-                ON group_members(user_id, left_at);
-            CREATE TABLE IF NOT EXISTS group_messages (
-                id TEXT PRIMARY KEY,
-                group_id TEXT NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
-                author_id TEXT NOT NULL REFERENCES users(id),
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS group_messages_by_group
-                ON group_messages(group_id, created_at);
             CREATE TABLE IF NOT EXISTS app_settings (
                 setting_key TEXT PRIMARY KEY,
                 setting_value INTEGER NOT NULL
@@ -164,10 +128,10 @@ def initialize_database() -> None:
                 room_level INTEGER NOT NULL DEFAULT 1,
                 shared_state TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
-                user1_vote INTEGER,
-                user2_vote INTEGER,
                 user1_share_vote INTEGER,
                 user2_share_vote INTEGER,
+                user1_share_voted_at TEXT,
+                user2_share_voted_at TEXT,
                 created_at TEXT NOT NULL,
                 dissolved_at TEXT
             );
@@ -193,6 +157,8 @@ def initialize_database() -> None:
                 asset_type TEXT NOT NULL,
                 content TEXT,
                 media_url TEXT,
+                emotion_tag TEXT,
+                source_message_id TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS daily_actions (
@@ -232,6 +198,11 @@ def initialize_database() -> None:
                 user2_id TEXT NOT NULL REFERENCES users(id),
                 archived_room_snapshot TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                continue_expires_at TEXT,
+                user1_continue_vote INTEGER,
+                user2_continue_vote INTEGER,
+                user1_continue_voted_at TEXT,
+                user2_continue_voted_at TEXT,
                 UNIQUE(user1_id, user2_id)
             );
             CREATE TABLE IF NOT EXISTS messages (
@@ -264,6 +235,36 @@ def initialize_database() -> None:
             db.execute("ALTER TABLE rooms ADD COLUMN user1_share_vote INTEGER")
         if "user2_share_vote" not in room_columns:
             db.execute("ALTER TABLE rooms ADD COLUMN user2_share_vote INTEGER")
+        if "user1_share_voted_at" not in room_columns:
+            db.execute("ALTER TABLE rooms ADD COLUMN user1_share_voted_at TEXT")
+        if "user2_share_voted_at" not in room_columns:
+            db.execute("ALTER TABLE rooms ADD COLUMN user2_share_voted_at TEXT")
+        migration_time = now_iso()
+        db.execute(
+            "UPDATE rooms SET user1_share_voted_at = ? WHERE user1_share_vote = 1 AND user1_share_voted_at IS NULL",
+            (migration_time,),
+        )
+        db.execute(
+            "UPDATE rooms SET user2_share_voted_at = ? WHERE user2_share_vote = 1 AND user2_share_voted_at IS NULL",
+            (migration_time,),
+        )
+        friendship_columns = {row["name"] for row in db.execute("PRAGMA table_info(friendships)")}
+        for column in (
+            "continue_expires_at", "user1_continue_vote", "user2_continue_vote",
+            "user1_continue_voted_at", "user2_continue_voted_at",
+        ):
+            if column not in friendship_columns:
+                column_type = "INTEGER" if column.endswith("_vote") else "TEXT"
+                db.execute(f"ALTER TABLE friendships ADD COLUMN {column} {column_type}")
+        db.execute(
+            "UPDATE friendships SET continue_expires_at = ? WHERE continue_expires_at IS NULL",
+            ((datetime.fromisoformat(migration_time) + timedelta(days=CONTINUE_WORLD_WINDOW_DAYS)).isoformat(),),
+        )
+        asset_columns = {row["name"] for row in db.execute("PRAGMA table_info(assets)")}
+        if "emotion_tag" not in asset_columns:
+            db.execute("ALTER TABLE assets ADD COLUMN emotion_tag TEXT")
+        if "source_message_id" not in asset_columns:
+            db.execute("ALTER TABLE assets ADD COLUMN source_message_id TEXT")
         db.execute(
             "INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('matching_radius_km', 40)"
         )
@@ -328,28 +329,28 @@ def active_room_for_user(db: sqlite3.Connection, user_id: str) -> sqlite3.Row | 
     ).fetchone()
 
 
-def active_group_for_user(db: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
-    return db.execute(
-        """SELECT g.* FROM group_rooms g JOIN group_members m ON m.group_id = g.id
-           WHERE g.status = 'active' AND m.user_id = ? AND m.left_at IS NULL LIMIT 1""",
-        (user_id,),
-    ).fetchone()
+def pending_share_expiry(room: sqlite3.Row) -> datetime | None:
+    first_vote_at = room["user1_share_voted_at"] if room["user1_share_vote"] == 1 else None
+    second_vote_at = room["user2_share_voted_at"] if room["user2_share_vote"] == 1 else None
+    pending_since = min((value for value in (first_vote_at, second_vote_at) if value), default=None)
+    has_one_yes = (room["user1_share_vote"] == 1) != (room["user2_share_vote"] == 1)
+    if has_one_yes and pending_since:
+        return datetime.fromisoformat(pending_since) + timedelta(hours=SHARE_MORE_REPLY_HOURS)
+    return None
 
 
-def serialize_group(db: sqlite3.Connection, group: sqlite3.Row, user_id: str) -> dict[str, Any]:
-    members = db.execute(
-        """SELECT u.id, u.anonymous_handle, u.neighborhood_tag, u.verification_tier
-           FROM group_members m JOIN users u ON u.id = m.user_id
-           WHERE m.group_id = ? AND m.left_at IS NULL ORDER BY m.joined_at""",
-        (group["id"],),
+def permanently_delete_room(db: sqlite3.Connection, room_id: str) -> list[Path]:
+    media_ids = db.execute(
+        "SELECT id FROM assets WHERE room_id = ? AND asset_type = 'polaroid' AND media_url IS NOT NULL",
+        (room_id,),
     ).fetchall()
-    return {
-        "group_id": group["id"],
-        "created_at": group["created_at"],
-        "members": [dict(member) for member in members],
-        "member_count": len(members),
-        "you_id": user_id,
-    }
+    db.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
+    return [DATABASE_PATH.parent / "media" / f"{asset['id']}.jpg" for asset in media_ids]
+
+
+def remove_room_media_files(paths: list[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
 
 
 def distance_between_km(first_lat: float, first_lng: float, second_lat: float, second_lng: float) -> float:
@@ -369,64 +370,6 @@ def pair_is_blocked(db: sqlite3.Connection, first_id: str, second_id: str) -> bo
     ).fetchone() is not None
 
 
-def create_group_from_queue(db: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
-    now = datetime.now(timezone.utc)
-    queue_cutoff = (now - timedelta(seconds=GROUP_FALLBACK_AFTER_SECONDS)).isoformat()
-    active_cutoff = (now - timedelta(minutes=MATCH_USER_ACTIVE_MINUTES)).isoformat()
-    waiting = db.execute(
-        """SELECT q.user_id, q.vibe_filters, q.queued_at, u.latitude, u.longitude,
-                  u.vibe_tags, u.last_seen_at
-           FROM match_queue q JOIN users u ON u.id = q.user_id
-           WHERE q.queued_at <= ? AND u.is_demo = 0 AND u.last_seen_at >= ?
-             AND NOT EXISTS (
-                 SELECT 1 FROM rooms r WHERE r.status = 'active'
-                   AND (r.user1_id = q.user_id OR r.user2_id = q.user_id)
-             )
-             AND NOT EXISTS (
-                 SELECT 1 FROM group_members gm JOIN group_rooms gr ON gr.id = gm.group_id
-                 WHERE gm.user_id = q.user_id AND gm.left_at IS NULL AND gr.status = 'active'
-             )
-           ORDER BY q.queued_at""",
-        (queue_cutoff, active_cutoff),
-    ).fetchall()
-    current = next((member for member in waiting if member["user_id"] == user_id), None)
-    if current is None:
-        return None
-
-    group_members = [current]
-    current_vibes = set(json.loads(current["vibe_filters"]) or json.loads(current["vibe_tags"]))
-    candidates = [member for member in waiting if member["user_id"] != user_id]
-    candidates.sort(
-        key=lambda member: (
-            -len(current_vibes.intersection(set(json.loads(member["vibe_filters"]) or json.loads(member["vibe_tags"])))),
-            member["queued_at"],
-        )
-    )
-    for candidate in candidates:
-        if len(group_members) >= 4:
-            break
-        if any(pair_is_blocked(db, candidate["user_id"], member["user_id"]) for member in group_members):
-            continue
-        if all(
-            distance_between_km(member["latitude"], member["longitude"], candidate["latitude"], candidate["longitude"])
-            <= GROUP_MATCHING_RADIUS_KM
-            for member in group_members
-        ):
-            group_members.append(candidate)
-    if len(group_members) < 3:
-        return None
-
-    group_id = str(uuid4())
-    created_at = now_iso()
-    db.execute("INSERT INTO group_rooms (id, created_at) VALUES (?, ?)", (group_id, created_at))
-    db.executemany(
-        "INSERT INTO group_members (group_id, user_id, joined_at) VALUES (?, ?, ?)",
-        [(group_id, member["user_id"], created_at) for member in group_members],
-    )
-    db.executemany("DELETE FROM match_queue WHERE user_id = ?", [(member["user_id"],) for member in group_members])
-    return db.execute("SELECT * FROM group_rooms WHERE id = ?", (group_id,)).fetchone()
-
-
 def serialize_asset(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -434,7 +377,43 @@ def serialize_asset(row: sqlite3.Row) -> dict[str, Any]:
         "asset_type": row["asset_type"],
         "content": row["content"],
         "media_url": row["media_url"],
+        "emotion_tag": row["emotion_tag"] if "emotion_tag" in row.keys() else None,
+        "source_message_id": row["source_message_id"] if "source_message_id" in row.keys() else None,
         "created_at": row["created_at"],
+    }
+
+
+def connection_capsule_snapshot(db: sqlite3.Connection, room: sqlite3.Row) -> dict[str, Any]:
+    assets = db.execute(
+        "SELECT * FROM assets WHERE room_id = ? ORDER BY created_at ASC", (room["id"],)
+    ).fetchall()
+    prompt_days = db.execute(
+        """SELECT prompt_day FROM daily_prompt_answers WHERE room_id = ?
+           GROUP BY prompt_day HAVING COUNT(DISTINCT user_id) = 2 ORDER BY prompt_day""",
+        (room["id"],),
+    ).fetchall()
+    prompts = []
+    for day_row in prompt_days:
+        answers = db.execute(
+            "SELECT user_id, answer, created_at FROM daily_prompt_answers WHERE room_id = ? AND prompt_day = ? ORDER BY created_at",
+            (room["id"], day_row["prompt_day"]),
+        ).fetchall()
+        prompts.append({"day": day_row["prompt_day"], "answers": [dict(row) for row in answers]})
+    return {
+        "room_id": room["id"],
+        "created_at": room["created_at"],
+        "shared_state": json.loads(room["shared_state"]),
+        "assets": [serialize_asset(asset) for asset in assets],
+        "shared_prompts": prompts,
+        "milestones": [
+            {"key": "first_conversation", "created_at": room["created_at"]},
+            *([{"key": "first_photo", "created_at": next(a["created_at"] for a in assets if a["asset_type"] == "polaroid")}]
+              if any(a["asset_type"] == "polaroid" for a in assets) else []),
+            *([{"key": "first_note", "created_at": next(a["created_at"] for a in assets if a["asset_type"] == "sticky_note")}]
+              if any(a["asset_type"] == "sticky_note" for a in assets) else []),
+            *([{"key": "first_shared_ritual", "created_at": prompts[0]["answers"][-1]["created_at"]}]
+              if prompts else []),
+        ],
     }
 
 
@@ -462,16 +441,32 @@ def serialize_daily_prompt(db: sqlite3.Connection, room: sqlite3.Row, user_id: s
     }
 
 
+def serialize_shared_prompt_history(
+    db: sqlite3.Connection, room: sqlite3.Row, user_id: str
+) -> list[dict[str, Any]]:
+    partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
+    days = db.execute(
+        """SELECT prompt_day FROM daily_prompt_answers WHERE room_id = ?
+           GROUP BY prompt_day HAVING COUNT(DISTINCT user_id) = 2 ORDER BY prompt_day""",
+        (room["id"],),
+    ).fetchall()
+    history = []
+    for row in days:
+        answers = db.execute(
+            "SELECT user_id, answer FROM daily_prompt_answers WHERE room_id = ? AND prompt_day = ?",
+            (room["id"], row["prompt_day"]),
+        ).fetchall()
+        by_user = {answer["user_id"]: answer["answer"] for answer in answers}
+        history.append({
+            "day": row["prompt_day"],
+            "question": DAILY_PROMPTS[(row["prompt_day"] - 1) % len(DAILY_PROMPTS)],
+            "my_answer": by_user.get(user_id),
+            "partner_answer": by_user.get(partner_id),
+        })
+    return history
+
+
 def serialize_room_message(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "author_id": row["author_id"],
-        "content": row["content"],
-        "created_at": row["created_at"],
-    }
-
-
-def serialize_group_message(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
         "author_id": row["author_id"],
@@ -493,11 +488,6 @@ def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> d
     assets = db.execute(
         "SELECT * FROM assets WHERE room_id = ? ORDER BY created_at ASC", (room["id"],)
     ).fetchall()
-    friendship = db.execute(
-        """SELECT id FROM friendships
-           WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
-        (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
-    ).fetchone()
     prompt_days = db.execute(
         """SELECT COUNT(*) AS count FROM (
                SELECT prompt_day FROM daily_prompt_answers
@@ -509,6 +499,8 @@ def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> d
     growth_stage = min(int(prompt_days), 3)
     share_vote = room["user1_share_vote"] if room["user1_id"] == user_id else room["user2_share_vote"]
     partner_vote = room["user2_share_vote"] if room["user1_id"] == user_id else room["user1_share_vote"]
+    my_vote_at = room["user1_share_voted_at"] if room["user1_id"] == user_id else room["user2_share_voted_at"]
+    partner_vote_at = room["user2_share_voted_at"] if room["user1_id"] == user_id else room["user1_share_voted_at"]
     shared_more = share_vote == 1 and partner_vote == 1
     partner_last_seen = partner["last_seen_at"] or partner["created_at"] if partner else None
     inactive_hours = 0
@@ -524,16 +516,22 @@ def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> d
             partner_data["vibe_tags"] = json.loads(partner["vibe_tags"])
     return {
         "room_id": room["id"],
+        "created_at": room["created_at"],
         "room_level": room["room_level"],
         "day_streak": min(days_elapsed, unmask_day),
         "days_elapsed": days_elapsed,
         "days_until_unmask": max(0, unmask_day - days_elapsed),
         "unmask_day_threshold": unmask_day,
         "daily_prompt": serialize_daily_prompt(db, room, user_id),
+        "shared_prompts": serialize_shared_prompt_history(db, room, user_id),
         "share_more": {
             "available": days_elapsed >= SHARE_MORE_DAY,
             "my_vote": share_vote,
             "mutual": shared_more,
+            "response_expires_at": (
+                (datetime.fromisoformat(my_vote_at) + timedelta(hours=SHARE_MORE_REPLY_HOURS)).isoformat()
+                if share_vote == 1 and partner_vote != 1 and my_vote_at else None
+            ),
             "partner_vibe_tags": json.loads(partner["vibe_tags"]) if shared_more and partner else [],
         },
         "plant_growth": {
@@ -546,9 +544,6 @@ def serialize_room(db: sqlite3.Connection, room: sqlite3.Row, user_id: str) -> d
         "assets": [serialize_asset(asset) for asset in assets],
         "partner": partner_data,
         "demo_companion": bool(partner and partner["is_demo"]),
-        "is_unmasked": friendship is not None,
-        "friendship_id": friendship["id"] if friendship else None,
-        "my_unmask_vote": room["user1_vote"] if room["user1_id"] == user_id else room["user2_vote"],
     }
 
 
@@ -575,8 +570,10 @@ class MatchRequest(BaseModel):
 
 
 class AssetRequest(BaseModel):
-    asset_type: str = Field(pattern=r"^sticky_note$")
+    asset_type: str = Field(pattern=r"^(sticky_note|chat_memory)$")
     content: str | None = Field(default=None, max_length=140)
+    emotion_tag: str | None = Field(default=None, pattern=r"^(happy|funny|deep|comforting|random)$")
+    message_id: str | None = None
 
 
 class DailyPromptRequest(BaseModel):
@@ -588,26 +585,22 @@ class ShareMoreRequest(BaseModel):
     accept: bool
 
 
+class ContinueWorldRequest(BaseModel):
+    pass
+
+
+class CircleReportRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class RoomMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=1000)
-
-
-class GroupBlockRequest(BaseModel):
-    blocked_user_id: str
-
-
-class GroupReportRequest(BaseModel):
-    reported_user_id: str
-    reason: str = Field(min_length=3, max_length=500)
 
 
 class PolaroidUploadRequest(BaseModel):
     image_base64: str = Field(min_length=100, max_length=3_000_000)
     content_type: str = Field(pattern=r"^image/(jpeg|png|webp)$")
-
-
-class UnmaskRequest(BaseModel):
-    accept: bool
+    emotion_tag: str | None = Field(default=None, pattern=r"^(happy|funny|deep|comforting|random)$")
 
 
 class MessageRequest(BaseModel):
@@ -791,10 +784,6 @@ async def find_companion(
         if room is not None:
             db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
             return serialize_room(db, room, user_id)
-        group = active_group_for_user(db, user_id)
-        if group is not None:
-            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
-            return {"status": "group", "group": serialize_group(db, group, user_id)}
         matching_radius = get_setting(db, "matching_radius_km", 40)
         current_vibes = set(payload.vibe_filters or json.loads(user["vibe_tags"]))
         now = datetime.now(timezone.utc)
@@ -812,9 +801,6 @@ async def find_companion(
                ON CONFLICT(user_id) DO UPDATE SET vibe_filters = excluded.vibe_filters""",
             (user_id, json.dumps(sorted(current_vibes)), now_value),
         )
-        group = create_group_from_queue(db, user_id)
-        if group is not None:
-            return {"status": "group", "group": serialize_group(db, group, user_id)}
         candidates = db.execute(
             """SELECT q.user_id, q.vibe_filters AS queued_vibes, q.queued_at,
                       u.latitude, u.longitude, u.vibe_tags
@@ -825,15 +811,16 @@ async def find_companion(
                        AND (r.user1_id = q.user_id OR r.user2_id = q.user_id)
                  )
                  AND NOT EXISTS (
-                     SELECT 1 FROM group_members gm JOIN group_rooms gr ON gr.id = gm.group_id
-                     WHERE gm.user_id = q.user_id AND gm.left_at IS NULL AND gr.status = 'active'
+                     SELECT 1 FROM friendships f WHERE
+                       (f.user1_id = ? AND f.user2_id = q.user_id)
+                       OR (f.user1_id = q.user_id AND f.user2_id = ?)
                  )
                  AND NOT EXISTS (
                      SELECT 1 FROM blocks b WHERE
                        (b.blocker_id = ? AND b.blocked_user_id = q.user_id)
                        OR (b.blocker_id = q.user_id AND b.blocked_user_id = ?)
                  )""",
-            (user_id, user_id, user_id),
+            (user_id, user_id, user_id, user_id, user_id),
         ).fetchall()
         ranked_candidates: list[tuple[int, float, str, sqlite3.Row, list[str]]] = []
         for candidate in candidates:
@@ -862,7 +849,7 @@ async def find_companion(
                 room_id,
                 partner_id,
                 user_id,
-                json.dumps({"plant_health": 100, "active_track": None, "theme": "sunset"}),
+                json.dumps({"plant_health": 100, "theme": "sunset"}),
                 now_iso(),
             ),
         )
@@ -888,10 +875,6 @@ def get_match_status(authorization: str | None = Header(default=None)) -> dict[s
         if room is not None:
             db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
             return {"status": "matched", "room": serialize_room(db, room, user_id)}
-        group = active_group_for_user(db, user_id)
-        if group is not None:
-            db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
-            return {"status": "group", "group": serialize_group(db, group, user_id)}
         queued = db.execute(
             "SELECT queued_at FROM match_queue WHERE user_id = ?", (user_id,)
         ).fetchone()
@@ -904,9 +887,6 @@ def get_match_status(authorization: str | None = Header(default=None)) -> dict[s
         if queue_age > timedelta(minutes=MATCH_QUEUE_TTL_MINUTES) or last_seen is None or now - last_seen > timedelta(minutes=MATCH_USER_ACTIVE_MINUTES):
             db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
             return {"status": "idle"}
-        group = create_group_from_queue(db, user_id)
-        if group is not None:
-            return {"status": "group", "group": serialize_group(db, group, user_id)}
         return {"status": "waiting", "queued_at": queued["queued_at"]}
 
 
@@ -918,135 +898,28 @@ def cancel_match_search(authorization: str | None = Header(default=None)) -> dic
         room = active_room_for_user(db, user_id)
         if room is not None:
             return {"status": "matched"}
-        group = active_group_for_user(db, user_id)
-        if group is not None:
-            return {"status": "group"}
         db.execute("DELETE FROM match_queue WHERE user_id = ?", (user_id,))
     return {"status": "cancelled"}
-
-
-@app.get("/api/v1/group/messages")
-def get_group_messages(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    user_id = get_user_id(authorization)
-    with database() as db:
-        group = active_group_for_user(db, user_id)
-        if group is None:
-            raise HTTPException(status_code=404, detail="You do not have an active group")
-        rows = db.execute(
-            "SELECT * FROM group_messages WHERE group_id = ? ORDER BY created_at DESC LIMIT 100",
-            (group["id"],),
-        ).fetchall()
-        return {"messages": [serialize_group_message(row) for row in reversed(rows)]}
-
-
-@app.post("/api/v1/group/messages")
-def create_group_message(
-    payload: RoomMessageRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    user_id = get_user_id(authorization)
-    ensure_user_can_interact(user_id)
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(status_code=422, detail="Write a message before sending")
-    with database() as db:
-        db.execute("BEGIN IMMEDIATE")
-        group = active_group_for_user(db, user_id)
-        if group is None:
-            raise HTTPException(status_code=404, detail="You do not have an active group")
-        message_id = str(uuid4())
-        db.execute(
-            "INSERT INTO group_messages (id, group_id, author_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
-            (message_id, group["id"], user_id, content, now_iso()),
-        )
-        message = serialize_group_message(
-            db.execute("SELECT * FROM group_messages WHERE id = ?", (message_id,)).fetchone()
-        )
-    return {"message": message}
-
-
-@app.post("/api/v1/group/leave")
-def leave_group(authorization: str | None = Header(default=None)) -> dict[str, str]:
-    user_id = get_user_id(authorization)
-    with database() as db:
-        db.execute("BEGIN IMMEDIATE")
-        group = active_group_for_user(db, user_id)
-        if group is None:
-            raise HTTPException(status_code=404, detail="You do not have an active group")
-        db.execute(
-            "UPDATE group_members SET left_at = ? WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
-            (now_iso(), group["id"], user_id),
-        )
-        remaining = db.execute(
-            "SELECT COUNT(*) AS count FROM group_members WHERE group_id = ? AND left_at IS NULL",
-            (group["id"],),
-        ).fetchone()["count"]
-        if remaining < 2:
-            db.execute("UPDATE group_rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?", (now_iso(), group["id"]))
-    return {"status": "left", "group_id": group["id"]}
-
-
-@app.post("/api/v1/group/block")
-def block_group_member(
-    payload: GroupBlockRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, str]:
-    user_id = get_user_id(authorization)
-    with database() as db:
-        db.execute("BEGIN IMMEDIATE")
-        group = active_group_for_user(db, user_id)
-        if group is None:
-            raise HTTPException(status_code=404, detail="You do not have an active group")
-        member = db.execute(
-            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
-            (group["id"], payload.blocked_user_id),
-        ).fetchone()
-        if member is None or payload.blocked_user_id == user_id:
-            raise HTTPException(status_code=404, detail="Group member not found")
-        db.execute(
-            "INSERT OR IGNORE INTO blocks (blocker_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
-            (user_id, payload.blocked_user_id, now_iso()),
-        )
-        db.execute(
-            "UPDATE group_members SET left_at = ? WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
-            (now_iso(), group["id"], user_id),
-        )
-    return {"status": "blocked_and_left", "group_id": group["id"]}
-
-
-@app.post("/api/v1/group/report")
-def report_group_member(
-    payload: GroupReportRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, str]:
-    user_id = get_user_id(authorization)
-    with database() as db:
-        group = active_group_for_user(db, user_id)
-        if group is None:
-            raise HTTPException(status_code=404, detail="You do not have an active group")
-        member = db.execute(
-            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ? AND left_at IS NULL",
-            (group["id"], payload.reported_user_id),
-        ).fetchone()
-        if member is None or payload.reported_user_id == user_id:
-            raise HTTPException(status_code=404, detail="Group member not found")
-        report_id = str(uuid4())
-        db.execute(
-            "INSERT INTO reports (id, room_id, reporter_id, reported_user_id, reason, created_at) VALUES (?, NULL, ?, ?, ?, ?)",
-            (report_id, user_id, payload.reported_user_id, payload.reason.strip(), now_iso()),
-        )
-    return {"status": "reported", "report_id": report_id}
 
 
 @app.get("/api/v1/room/active")
 def get_active_room(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     user_id = get_user_id(authorization)
+    expired_media: list[Path] = []
+    expired = False
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         room = active_room_for_user(db, user_id)
-        if room is None:
-            raise HTTPException(status_code=404, detail="You do not have an active room")
-        return serialize_room(db, room, user_id)
+        expires_at = pending_share_expiry(room) if room else None
+        if room and expires_at and datetime.now(timezone.utc) >= expires_at:
+            expired_media = permanently_delete_room(db, room["id"])
+            expired = True
+            room = None
+        result = serialize_room(db, room, user_id) if room else None
+    remove_room_media_files(expired_media)
+    if expired or result is None:
+        raise HTTPException(status_code=404, detail="You do not have an active room")
+    return result
 
 
 @app.get("/api/v1/room/messages")
@@ -1104,6 +977,7 @@ async def share_more(
 ) -> dict[str, Any]:
     user_id = get_user_id(authorization)
     ensure_user_can_interact(user_id)
+    media_paths: list[Path] = []
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         room = active_room_for_user(db, user_id)
@@ -1111,46 +985,67 @@ async def share_more(
             raise HTTPException(status_code=404, detail="You do not have an active room")
         if room_day(room) < SHARE_MORE_DAY:
             raise HTTPException(status_code=409, detail="Sharing more opens on day 3")
-        column = "user1_share_vote" if room["user1_id"] == user_id else "user2_share_vote"
-        db.execute(f"UPDATE rooms SET {column} = ? WHERE id = ?", (int(payload.accept), room["id"]))
-        partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
-        partner = db.execute("SELECT is_demo FROM users WHERE id = ?", (partner_id,)).fetchone()
-        if payload.accept and partner and partner["is_demo"]:
-            other_column = "user2_share_vote" if room["user1_id"] == user_id else "user1_share_vote"
-            db.execute(f"UPDATE rooms SET {other_column} = 1 WHERE id = ?", (room["id"],))
-        updated = db.execute("SELECT * FROM rooms WHERE id = ?", (room["id"],)).fetchone()
-        result: dict[str, Any] = {"share_more": serialize_room(db, updated, user_id)["share_more"]}
-        if payload.accept and updated["user1_share_vote"] == 1 and updated["user2_share_vote"] == 1:
-            friendship_id = str(uuid4())
-            db.execute(
-                """INSERT OR IGNORE INTO friendships
-                   (id, user1_id, user2_id, archived_room_snapshot, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (
-                    friendship_id,
-                    room["user1_id"],
-                    room["user2_id"],
-                    json.dumps({"room_id": room["id"], "shared_state": json.loads(room["shared_state"])}),
-                    now_iso(),
-                ),
-            )
-            friendship = db.execute(
-                """SELECT id FROM friendships
-                   WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
-                (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
-            ).fetchone()
-            if friendship:
-                db.execute(
-                    """INSERT OR IGNORE INTO messages (id, friendship_id, author_id, content, created_at)
-                       SELECT id, ?, author_id, content, created_at FROM room_messages WHERE room_id = ?""",
-                    (friendship["id"], room["id"]),
-                )
-            db.execute("UPDATE rooms SET status = 'graduated' WHERE id = ?", (room["id"],))
-            result.update({"status": "graduated", "friendship_id": friendship["id"] if friendship else None})
+        if not payload.accept:
+            room_id = room["id"]
+            media_paths = permanently_delete_room(db, room_id)
+            result = {"status": "dissolved", "room_id": room_id}
         else:
-            result["status"] = "waiting_for_partner" if payload.accept else "still_anonymous"
-    event = "unmask_updated" if result["status"] == "graduated" else "share_more_updated"
-    await manager.broadcast(room["id"], room_payload(room["id"], event, result))
+            column = "user1_share_vote" if room["user1_id"] == user_id else "user2_share_vote"
+            voted_at_column = "user1_share_voted_at" if room["user1_id"] == user_id else "user2_share_voted_at"
+            db.execute(f"UPDATE rooms SET {column} = 1, {voted_at_column} = ? WHERE id = ?", (now_iso(), room["id"]))
+            partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
+            partner = db.execute("SELECT is_demo FROM users WHERE id = ?", (partner_id,)).fetchone()
+            if partner and partner["is_demo"]:
+                other_column = "user2_share_vote" if room["user1_id"] == user_id else "user1_share_vote"
+                other_voted_at_column = "user2_share_voted_at" if room["user1_id"] == user_id else "user1_share_voted_at"
+                db.execute(f"UPDATE rooms SET {other_column} = 1, {other_voted_at_column} = ? WHERE id = ?", (now_iso(), room["id"]))
+            updated = db.execute("SELECT * FROM rooms WHERE id = ?", (room["id"],)).fetchone()
+            result = {"share_more": serialize_room(db, updated, user_id)["share_more"]}
+            if updated["user1_share_vote"] == 1 and updated["user2_share_vote"] == 1:
+                friendship_id = str(uuid4())
+                graduated_at = now_iso()
+                continue_expires_at = (datetime.fromisoformat(graduated_at) + timedelta(days=CONTINUE_WORLD_WINDOW_DAYS)).isoformat()
+                db.execute(
+                    """INSERT OR IGNORE INTO friendships
+                       (id, user1_id, user2_id, archived_room_snapshot, created_at, continue_expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        friendship_id,
+                        room["user1_id"],
+                        room["user2_id"],
+                        json.dumps(connection_capsule_snapshot(db, room)),
+                        graduated_at,
+                        continue_expires_at,
+                    ),
+                )
+                friendship = db.execute(
+                    """SELECT id FROM friendships
+                       WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
+                    (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
+                ).fetchone()
+                if friendship:
+                    db.execute(
+                        """UPDATE friendships SET archived_room_snapshot = ?, created_at = ?,
+                           continue_expires_at = ?, user1_continue_vote = NULL,
+                           user2_continue_vote = NULL, user1_continue_voted_at = NULL,
+                           user2_continue_voted_at = NULL WHERE id = ?""",
+                        (json.dumps(connection_capsule_snapshot(db, room)), graduated_at, continue_expires_at, friendship["id"]),
+                    )
+                    db.execute(
+                        """INSERT OR IGNORE INTO messages (id, friendship_id, author_id, content, created_at)
+                           SELECT id, ?, author_id, content, created_at FROM room_messages WHERE room_id = ?""",
+                        (friendship["id"], room["id"]),
+                    )
+                db.execute("UPDATE rooms SET status = 'graduated' WHERE id = ?", (room["id"],))
+                result.update({"status": "graduated", "friendship_id": friendship["id"] if friendship else None})
+            else:
+                result["status"] = "waiting_for_partner"
+    if result["status"] == "dissolved":
+        remove_room_media_files(media_paths)
+        await manager.broadcast(result["room_id"], room_payload(result["room_id"], "room_dissolved", {"declined": True}))
+    else:
+        event = "unmask_updated" if result["status"] == "graduated" else "share_more_updated"
+        await manager.broadcast(room["id"], room_payload(room["id"], event, result))
     return result
 
 
@@ -1209,17 +1104,28 @@ async def create_room_asset(
 ) -> dict[str, Any]:
     user_id = get_user_id(authorization)
     ensure_user_can_interact(user_id)
-    if not (payload.content or "").strip():
-        raise HTTPException(status_code=422, detail="Sticky notes need text")
     with database() as db:
         room = active_room_for_user(db, user_id)
         if room is None:
             raise HTTPException(status_code=404, detail="You do not have an active room")
+        content = (payload.content or "").strip()
+        if payload.asset_type == "chat_memory":
+            if not payload.message_id:
+                raise HTTPException(status_code=422, detail="Choose a chat message to save")
+            source_message = db.execute(
+                "SELECT content FROM room_messages WHERE id = ? AND room_id = ?",
+                (payload.message_id, room["id"]),
+            ).fetchone()
+            if source_message is None:
+                raise HTTPException(status_code=404, detail="Chat message not found in this room")
+            content = source_message["content"]
+        elif not content:
+            raise HTTPException(status_code=422, detail="Sticky notes need text")
         asset_id = str(uuid4())
         db.execute(
-            """INSERT INTO assets (id, room_id, author_id, asset_type, content, media_url, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (asset_id, room["id"], user_id, payload.asset_type, payload.content, None, now_iso()),
+            """INSERT INTO assets (id, room_id, author_id, asset_type, content, media_url, emotion_tag, source_message_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (asset_id, room["id"], user_id, payload.asset_type, content, None, payload.emotion_tag, payload.message_id, now_iso()),
         )
         asset = db.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
     await manager.broadcast(room["id"], room_payload(room["id"], "state_sync", {"asset": serialize_asset(asset)}))
@@ -1266,20 +1172,20 @@ async def upload_polaroid(
         room = active_room_for_user(db, user_id)
         if room is None:
             raise HTTPException(status_code=404, detail="You do not have an active room")
-        uploaded_today = db.execute(
+        uploaded_recently = db.execute(
             """SELECT 1 FROM assets WHERE room_id = ? AND author_id = ? AND asset_type = 'polaroid'
-               AND date(created_at) = date('now')""",
+               AND julianday(created_at) >= julianday('now', '-24 hours')""",
             (room["id"], user_id),
         ).fetchone()
-        if uploaded_today:
-            raise HTTPException(status_code=429, detail="You can add one polaroid per day")
+        if uploaded_recently:
+            raise HTTPException(status_code=429, detail="You can add one polaroid every 24 hours")
         media_path.write_bytes(image_bytes)
         media_url = f"/api/v1/media/{asset_id}"
         try:
             db.execute(
-                """INSERT INTO assets (id, room_id, author_id, asset_type, media_url, created_at)
-                   VALUES (?, ?, ?, 'polaroid', ?, ?)""",
-                (asset_id, room["id"], user_id, media_url, now_iso()),
+                """INSERT INTO assets (id, room_id, author_id, asset_type, media_url, emotion_tag, created_at)
+                   VALUES (?, ?, ?, 'polaroid', ?, ?, ?)""",
+                (asset_id, room["id"], user_id, media_url, payload.emotion_tag, now_iso()),
             )
         except sqlite3.Error:
             media_path.unlink(missing_ok=True)
@@ -1300,8 +1206,14 @@ def get_polaroid(
         asset = db.execute(
             """SELECT a.media_url FROM assets a JOIN rooms r ON r.id = a.room_id
                WHERE a.id = ? AND a.asset_type = 'polaroid'
-                 AND (r.user1_id = ? OR r.user2_id = ?)""",
-            (asset_id, user_id, user_id),
+                 AND (r.user1_id = ? OR r.user2_id = ?)
+                 AND (r.status = 'active' OR EXISTS (
+                   SELECT 1 FROM friendships f WHERE
+                     ((f.user1_id = r.user1_id AND f.user2_id = r.user2_id)
+                       OR (f.user1_id = r.user2_id AND f.user2_id = r.user1_id))
+                     AND (f.user1_id = ? OR f.user2_id = ?)
+                 ))""",
+            (asset_id, user_id, user_id, user_id, user_id),
         ).fetchone()
         if asset is None:
             raise HTTPException(status_code=404, detail="Photo not found")
@@ -1336,15 +1248,14 @@ async def water_plant(authorization: str | None = Header(default=None)) -> dict[
 @app.post("/api/v1/room/dissolve")
 async def dissolve_room(authorization: str | None = Header(default=None)) -> dict[str, str]:
     user_id = get_user_id(authorization)
+    media_paths: list[Path] = []
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         room = active_room_for_user(db, user_id)
         if room is None:
             raise HTTPException(status_code=404, detail="You do not have an active room")
-        db.execute(
-            "UPDATE rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?",
-            (now_iso(), room["id"]),
-        )
+        media_paths = permanently_delete_room(db, room["id"])
+    remove_room_media_files(media_paths)
     await manager.broadcast(room["id"], room_payload(room["id"], "room_dissolved", {}))
     return {"status": "dissolved", "room_id": room["id"]}
 
@@ -1352,6 +1263,7 @@ async def dissolve_room(authorization: str | None = Header(default=None)) -> dic
 @app.post("/api/v1/room/block")
 async def block_room_partner(authorization: str | None = Header(default=None)) -> dict[str, str]:
     user_id = get_user_id(authorization)
+    media_paths: list[Path] = []
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
         room = active_room_for_user(db, user_id)
@@ -1362,96 +1274,227 @@ async def block_room_partner(authorization: str | None = Header(default=None)) -
             "INSERT OR IGNORE INTO blocks (blocker_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
             (user_id, partner_id, now_iso()),
         )
-        db.execute(
-            "UPDATE rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?",
-            (now_iso(), room["id"]),
-        )
+        media_paths = permanently_delete_room(db, room["id"])
+    remove_room_media_files(media_paths)
     await manager.broadcast(room["id"], room_payload(room["id"], "room_dissolved", {"blocked": True}))
     return {"status": "blocked", "room_id": room["id"]}
-
-
-@app.post("/api/v1/room/unmask-opt-in")
-async def unmask_opt_in(
-    payload: UnmaskRequest, authorization: str | None = Header(default=None)
-) -> dict[str, Any]:
-    user_id = get_user_id(authorization)
-    with database() as db:
-        db.execute("BEGIN IMMEDIATE")
-        room = active_room_for_user(db, user_id)
-        if room is None:
-            raise HTTPException(status_code=404, detail="You do not have an active room")
-        if payload.accept:
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(room["created_at"])).days + 1
-            unmask_day = get_setting(db, "unmask_day_threshold", 3)
-            if elapsed < unmask_day:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Unmasking opens on day {unmask_day} ({unmask_day - elapsed} days to go)",
-                )
-        column = "user1_vote" if room["user1_id"] == user_id else "user2_vote"
-        db.execute(f"UPDATE rooms SET {column} = ? WHERE id = ?", (int(payload.accept), room["id"]))
-        updated = db.execute("SELECT * FROM rooms WHERE id = ?", (room["id"],)).fetchone()
-        if not payload.accept:
-            db.execute(
-                "UPDATE rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ?",
-                (now_iso(), room["id"]),
-            )
-            result = {"status": "dissolved", "is_unmasked": False}
-        else:
-            partner_id = room["user2_id"] if room["user1_id"] == user_id else room["user1_id"]
-            partner = db.execute("SELECT is_demo FROM users WHERE id = ?", (partner_id,)).fetchone()
-            if partner and partner["is_demo"]:
-                other_vote = "user2_vote" if room["user1_id"] == user_id else "user1_vote"
-                db.execute(f"UPDATE rooms SET {other_vote} = 1 WHERE id = ?", (room["id"],))
-                updated = db.execute("SELECT * FROM rooms WHERE id = ?", (room["id"],)).fetchone()
-        if payload.accept and updated["user1_vote"] == 1 and updated["user2_vote"] == 1:
-            friendship_id = str(uuid4())
-            db.execute(
-                """INSERT OR IGNORE INTO friendships
-                   (id, user1_id, user2_id, archived_room_snapshot, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (
-                    friendship_id,
-                    room["user1_id"],
-                    room["user2_id"],
-                    json.dumps({"room_id": room["id"], "shared_state": json.loads(room["shared_state"])}),
-                    now_iso(),
-                ),
-            )
-            friendship = db.execute(
-                """SELECT id FROM friendships
-                   WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)""",
-                (room["user1_id"], room["user2_id"], room["user2_id"], room["user1_id"]),
-            ).fetchone()
-            if friendship:
-                db.execute(
-                    """INSERT OR IGNORE INTO messages (id, friendship_id, author_id, content, created_at)
-                       SELECT id, ?, author_id, content, created_at FROM room_messages WHERE room_id = ?""",
-                    (friendship["id"], room["id"]),
-                )
-            db.execute(
-                "UPDATE rooms SET status = 'graduated' WHERE id = ?", (room["id"],)
-            )
-            result = {"status": "graduated", "is_unmasked": True, "friendship_id": friendship_id}
-        else:
-            result = {"status": "waiting_for_partner", "is_unmasked": False}
-    await manager.broadcast(room["id"], room_payload(room["id"], "unmask_updated", result))
-    return result
 
 
 @app.get("/api/v1/circles")
 def get_circles(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     user_id = get_user_id(authorization)
     with database() as db:
+        db.execute("BEGIN IMMEDIATE")
         friendships = db.execute(
-            """SELECT f.id AS friendship_id, f.created_at, u.id AS partner_id,
-                      u.anonymous_handle, u.neighborhood_tag, u.verification_tier
+            """SELECT f.id AS friendship_id, f.user1_id, f.user2_id, f.created_at,
+                      f.continue_expires_at, f.user1_continue_vote, f.user2_continue_vote,
+                      f.user1_continue_voted_at, f.user2_continue_voted_at,
+                      u.id AS partner_id, u.anonymous_handle, u.neighborhood_tag, u.verification_tier
                FROM friendships f JOIN users u ON u.id =
                  CASE WHEN f.user1_id = ? THEN f.user2_id ELSE f.user1_id END
                WHERE f.user1_id = ? OR f.user2_id = ? ORDER BY f.created_at DESC""",
             (user_id, user_id, user_id),
         ).fetchall()
-        return {"friendships": [dict(row) for row in friendships]}
+        results = []
+        now = datetime.now(timezone.utc)
+        for row in friendships:
+            first_user = row["user1_id"] == user_id
+            my_vote = row["user1_continue_vote"] if first_user else row["user2_continue_vote"]
+            partner_vote = row["user2_continue_vote"] if first_user else row["user1_continue_vote"]
+            my_voted_at = row["user1_continue_voted_at"] if first_user else row["user2_continue_voted_at"]
+            partner_voted_at = row["user2_continue_voted_at"] if first_user else row["user1_continue_voted_at"]
+            response_expires_at = None
+            if (my_vote == 1) != (partner_vote == 1):
+                pending_since = my_voted_at if my_vote == 1 else partner_voted_at
+                if pending_since:
+                    response_expires_at = (datetime.fromisoformat(pending_since) + timedelta(hours=SHARE_MORE_REPLY_HOURS)).isoformat()
+                    if now >= datetime.fromisoformat(response_expires_at):
+                        db.execute(
+                            """UPDATE friendships SET user1_continue_vote = NULL, user2_continue_vote = NULL,
+                               user1_continue_voted_at = NULL, user2_continue_voted_at = NULL WHERE id = ?""",
+                            (row["friendship_id"],),
+                        )
+                        my_vote = partner_vote = None
+                        response_expires_at = None
+            active = db.execute(
+                """SELECT 1 FROM rooms WHERE status = 'active' AND
+                   ((user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?))""",
+                (row["user1_id"], row["user2_id"], row["user2_id"], row["user1_id"]),
+            ).fetchone() is not None
+            active_conflict = db.execute(
+                """SELECT 1 FROM rooms WHERE status = 'active' AND
+                   (user1_id IN (?, ?) OR user2_id IN (?, ?)) LIMIT 1""",
+                (row["user1_id"], row["user2_id"], row["user1_id"], row["user2_id"]),
+            ).fetchone() is not None
+            window_open = bool(row["continue_expires_at"] and now < datetime.fromisoformat(row["continue_expires_at"]))
+            results.append({
+                "friendship_id": row["friendship_id"],
+                "partner_id": row["partner_id"],
+                "anonymous_handle": row["anonymous_handle"],
+                "neighborhood_tag": row["neighborhood_tag"],
+                "verification_tier": row["verification_tier"],
+                "created_at": row["created_at"],
+                "continue_expires_at": row["continue_expires_at"],
+                "continue_available": window_open and not active and not active_conflict,
+                "continue_blocked": active_conflict and not active,
+                "my_continue_vote": my_vote,
+                "partner_continue_vote": partner_vote,
+                "continue_response_expires_at": response_expires_at,
+                "world_active": active,
+            })
+        return {"friendships": results}
+
+
+def delete_circle_connection(
+    db: sqlite3.Connection,
+    friendship: sqlite3.Row,
+    user_id: str,
+    action: str,
+    reason: str | None = None,
+) -> tuple[list[str], list[Path]]:
+    partner_id = friendship["user2_id"] if friendship["user1_id"] == user_id else friendship["user1_id"]
+    rooms = db.execute(
+        """SELECT id FROM rooms WHERE (user1_id = ? AND user2_id = ?)
+           OR (user1_id = ? AND user2_id = ?)""",
+        (user_id, partner_id, partner_id, user_id),
+    ).fetchall()
+    room_ids = [row["id"] for row in rooms]
+    media_paths: list[Path] = []
+    for room_id in room_ids:
+        media = db.execute(
+            "SELECT id FROM assets WHERE room_id = ? AND asset_type = 'polaroid' AND media_url IS NOT NULL",
+            (room_id,),
+        ).fetchall()
+        media_paths.extend(DATABASE_PATH.parent / "media" / f"{asset['id']}.jpg" for asset in media)
+    if action == "report":
+        db.execute(
+            """INSERT INTO reports (id, room_id, reporter_id, reported_user_id, reason, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (str(uuid4()), room_ids[-1] if room_ids else None, user_id, partner_id, (reason or "").strip(), now_iso()),
+        )
+    if action in {"block", "report"}:
+        db.execute(
+            "INSERT OR IGNORE INTO blocks (blocker_id, blocked_user_id, created_at) VALUES (?, ?, ?)",
+            (user_id, partner_id, now_iso()),
+        )
+    for room_id in room_ids:
+        db.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
+    db.execute("DELETE FROM friendships WHERE id = ?", (friendship["id"],))
+    return room_ids, media_paths
+
+
+async def circle_connection_action(
+    friendship_id: str,
+    user_id: str,
+    action: str,
+    reason: str | None = None,
+) -> dict[str, str]:
+    room_ids: list[str] = []
+    media_paths: list[Path] = []
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        friendship = db.execute(
+            "SELECT * FROM friendships WHERE id = ? AND (user1_id = ? OR user2_id = ?)",
+            (friendship_id, user_id, user_id),
+        ).fetchone()
+        if friendship is None:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        room_ids, media_paths = delete_circle_connection(db, friendship, user_id, action, reason)
+    remove_room_media_files(media_paths)
+    for room_id in room_ids:
+        await manager.broadcast(room_id, room_payload(room_id, "room_dissolved", {"removed": True}))
+    return {"status": action, "room_id": room_ids[-1] if room_ids else ""}
+
+
+@app.post("/api/v1/circles/{friendship_id}/block")
+async def block_circle_connection(
+    friendship_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    return await circle_connection_action(friendship_id, get_user_id(authorization), "block")
+
+
+@app.post("/api/v1/circles/{friendship_id}/remove")
+async def remove_circle_connection(
+    friendship_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    return await circle_connection_action(friendship_id, get_user_id(authorization), "remove")
+
+
+@app.post("/api/v1/circles/{friendship_id}/report")
+async def report_circle_connection(
+    friendship_id: str,
+    payload: CircleReportRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    return await circle_connection_action(friendship_id, get_user_id(authorization), "report", payload.reason)
+
+
+@app.post("/api/v1/circles/{friendship_id}/continue")
+async def continue_world(
+    friendship_id: str,
+    payload: ContinueWorldRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user_id = get_user_id(authorization)
+    ensure_user_can_interact(user_id)
+    room_id: str | None = None
+    waiting = False
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        friendship = db.execute(
+            "SELECT * FROM friendships WHERE id = ? AND (user1_id = ? OR user2_id = ?)",
+            (friendship_id, user_id, user_id),
+        ).fetchone()
+        if friendship is None:
+            raise HTTPException(status_code=404, detail="Connection not found")
+        expiry = datetime.fromisoformat(friendship["continue_expires_at"]) if friendship["continue_expires_at"] else None
+        if expiry is None or datetime.now(timezone.utc) >= expiry:
+            raise HTTPException(status_code=410, detail="The 7-day continue window has ended")
+        first_user = friendship["user1_id"] == user_id
+        own_vote_column = "user1_continue_vote" if first_user else "user2_continue_vote"
+        partner_vote_column = "user2_continue_vote" if first_user else "user1_continue_vote"
+        own_time_column = "user1_continue_voted_at" if first_user else "user2_continue_voted_at"
+        partner_time_column = "user2_continue_voted_at" if first_user else "user1_continue_voted_at"
+        own_vote = friendship[own_vote_column]
+        partner_vote = friendship[partner_vote_column]
+        if (own_vote == 1) != (partner_vote == 1):
+            pending_at = friendship[own_time_column] if own_vote == 1 else friendship[partner_time_column]
+            if pending_at and datetime.now(timezone.utc) >= datetime.fromisoformat(pending_at) + timedelta(hours=SHARE_MORE_REPLY_HOURS):
+                db.execute(
+                    """UPDATE friendships SET user1_continue_vote = NULL, user2_continue_vote = NULL,
+                       user1_continue_voted_at = NULL, user2_continue_voted_at = NULL WHERE id = ?""",
+                    (friendship_id,),
+                )
+                own_vote = partner_vote = None
+        snapshot = json.loads(friendship["archived_room_snapshot"])
+        room_id = snapshot.get("room_id")
+        room = db.execute("SELECT * FROM rooms WHERE id = ? AND status = 'graduated'", (room_id,)).fetchone()
+        if room is None:
+            raise HTTPException(status_code=409, detail="The archived world can no longer be reopened")
+        db.execute(
+            f"UPDATE friendships SET {own_vote_column} = 1, {own_time_column} = COALESCE({own_time_column}, ?) WHERE id = ?",
+            (now_iso(), friendship_id),
+        )
+        if own_vote != 1:
+            own_vote = 1
+        if partner_vote == 1:
+            active_conflict = db.execute(
+                """SELECT id FROM rooms WHERE status = 'active' AND id != ? AND
+                   (user1_id IN (?, ?) OR user2_id IN (?, ?)) LIMIT 1""",
+                (room_id, friendship["user1_id"], friendship["user2_id"], friendship["user1_id"], friendship["user2_id"]),
+            ).fetchone()
+            if active_conflict:
+                raise HTTPException(status_code=409, detail="Both people need to finish their current island first")
+            db.execute("UPDATE rooms SET status = 'active', dissolved_at = NULL WHERE id = ?", (room_id,))
+            waiting = False
+        else:
+            waiting = True
+    if room_id and not waiting:
+        await manager.broadcast(room_id, room_payload(room_id, "state_sync", {"kind": "world_continued"}))
+        return {"status": "continued", "room_id": room_id}
+    return {"status": "waiting"}
 
 
 @app.get("/api/v1/circles/{friendship_id}/messages")
@@ -1556,16 +1599,10 @@ def admin_overview(x_admin_token: str | None = Header(default=None)) -> dict[str
         active = db.execute("SELECT COUNT(*) AS count FROM rooms WHERE status = 'active'").fetchone()["count"]
         graduated = db.execute("SELECT COUNT(*) AS count FROM friendships").fetchone()["count"]
         open_reports = db.execute("SELECT COUNT(*) AS count FROM reports WHERE status = 'open'").fetchone()["count"]
-        active_groups = db.execute("SELECT COUNT(*) AS count FROM group_rooms WHERE status = 'active'").fetchone()["count"]
         two_way_chats = db.execute(
             """SELECT COUNT(*) AS count FROM (
-                   SELECT conversation_type, conversation_id FROM (
-                       SELECT 'room' AS conversation_type, m.room_id AS conversation_id, m.author_id
-                       FROM room_messages m JOIN users u ON u.id = m.author_id WHERE u.is_demo = 0
-                       UNION ALL
-                       SELECT 'group' AS conversation_type, m.group_id AS conversation_id, m.author_id
-                       FROM group_messages m JOIN users u ON u.id = m.author_id WHERE u.is_demo = 0
-                   ) GROUP BY conversation_type, conversation_id
+                   SELECT m.room_id FROM room_messages m JOIN users u ON u.id = m.author_id WHERE u.is_demo = 0
+                   GROUP BY m.room_id
                    HAVING COUNT(DISTINCT author_id) >= 2
                )"""
         ).fetchone()["count"]
@@ -1585,7 +1622,6 @@ def admin_overview(x_admin_token: str | None = Header(default=None)) -> dict[str
         return {
             "users": users,
             "active_rooms": active,
-            "active_groups": active_groups,
             "graduated_friendships": graduated,
             "open_reports": open_reports,
             "two_way_chats": two_way_chats,
@@ -1637,13 +1673,6 @@ async def moderate_report(
                 """UPDATE rooms SET status = 'dissolved', dissolved_at = ?
                    WHERE status = 'active' AND (user1_id = ? OR user2_id = ?)""",
                 (now_iso(), report["reported_user_id"], report["reported_user_id"]),
-            )
-            db.execute(
-                """UPDATE group_rooms SET status = 'dissolved', dissolved_at = ?
-                   WHERE status = 'active' AND id IN (
-                       SELECT group_id FROM group_members WHERE user_id = ? AND left_at IS NULL
-                   )""",
-                (now_iso(), report["reported_user_id"]),
             )
         elif action == "shadow_ban":
             db.execute("UPDATE users SET is_shadow_banned = 1 WHERE id = ?", (report["reported_user_id"],))
@@ -1733,13 +1762,6 @@ async def admin_user_action(
                        WHERE status = 'active' AND (user1_id = ? OR user2_id = ?)""",
                     (now_iso(), user_id, user_id),
                 )
-                db.execute(
-                    """UPDATE group_rooms SET status = 'dissolved', dissolved_at = ?
-                       WHERE status = 'active' AND id IN (
-                           SELECT group_id FROM group_members WHERE user_id = ? AND left_at IS NULL
-                       )""",
-                    (now_iso(), user_id),
-                )
     for room_id in room_ids:
         await manager.broadcast(
             room_id,
@@ -1772,37 +1794,6 @@ def admin_rooms(x_admin_token: str | None = Header(default=None)) -> dict[str, A
                WHERE r.status = 'active' ORDER BY r.created_at"""
         ).fetchall()
         return {"rooms": [dict(row) for row in rooms]}
-
-
-@app.get("/api/v1/admin/groups")
-def admin_groups(x_admin_token: str | None = Header(default=None)) -> dict[str, Any]:
-    require_admin(x_admin_token)
-    with database() as db:
-        groups = db.execute(
-            """SELECT g.id AS group_id, g.created_at, COUNT(m.user_id) AS member_count,
-                      GROUP_CONCAT(u.anonymous_handle, ', ') AS member_handles
-               FROM group_rooms g JOIN group_members m ON m.group_id = g.id
-               JOIN users u ON u.id = m.user_id
-               WHERE g.status = 'active' AND m.left_at IS NULL
-               GROUP BY g.id ORDER BY g.created_at"""
-        ).fetchall()
-        return {"groups": [dict(row) for row in groups]}
-
-
-@app.post("/api/v1/admin/groups/{group_id}/dissolve")
-def admin_dissolve_group(
-    group_id: str,
-    x_admin_token: str | None = Header(default=None),
-) -> dict[str, str]:
-    require_admin(x_admin_token)
-    with database() as db:
-        cursor = db.execute(
-            "UPDATE group_rooms SET status = 'dissolved', dissolved_at = ? WHERE id = ? AND status = 'active'",
-            (now_iso(), group_id),
-        )
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Active group not found")
-    return {"status": "dissolved", "group_id": group_id}
 
 
 @app.put("/api/v1/admin/settings")
@@ -1869,39 +1860,6 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                 await manager.broadcast(
                     room_id,
                     room_payload(room_id, "haptic_nudge", {"from": user_id, "type": "coffee_bump"}),
-                )
-            elif event_type == "update_jukebox":
-                try:
-                    ensure_user_can_interact(user_id)
-                except HTTPException as exc:
-                    await websocket.send_json(room_payload(room_id, "error", {"message": exc.detail}))
-                    continue
-                track = str(event.get("track_id", ""))[:100]
-                with database() as db:
-                    room = get_room(db, room_id, user_id)
-                    state = json.loads(room["shared_state"])
-                    state["active_track"] = track or None
-                    db.execute("UPDATE rooms SET shared_state = ? WHERE id = ?", (json.dumps(state), room_id))
-                await manager.broadcast(room_id, room_payload(room_id, "state_sync", {"active_track": track}))
-            elif event_type == "update_room_ambience":
-                try:
-                    ensure_user_can_interact(user_id)
-                except HTTPException as exc:
-                    await websocket.send_json(room_payload(room_id, "error", {"message": exc.detail}))
-                    continue
-                ambience_id = str(event.get("ambience_id", ""))
-                if ambience_id not in ROOM_AMBIENCE_IDS:
-                    await websocket.send_json(room_payload(room_id, "error", {"message": "Unknown room ambience"}))
-                    continue
-                with database() as db:
-                    room = get_room(db, room_id, user_id)
-                    state = json.loads(room["shared_state"])
-                    state["ambience_id"] = ambience_id
-                    state["theme"] = ambience_id
-                    db.execute("UPDATE rooms SET shared_state = ? WHERE id = ?", (json.dumps(state), room_id))
-                await manager.broadcast(
-                    room_id,
-                    room_payload(room_id, "state_sync", {"ambience_id": ambience_id, "theme": ambience_id}),
                 )
             elif event_type == "presence":
                 await manager.broadcast(

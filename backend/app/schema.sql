@@ -34,31 +34,6 @@ CREATE TABLE match_queue (
     queued_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE group_rooms (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'dissolved')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    dissolved_at TIMESTAMPTZ
-);
-
-CREATE TABLE group_members (
-    group_id UUID NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    joined_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    left_at TIMESTAMPTZ,
-    PRIMARY KEY (group_id, user_id)
-);
-CREATE INDEX idx_active_group_members_user ON group_members(user_id, left_at);
-
-CREATE TABLE group_messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    group_id UUID NOT NULL REFERENCES group_rooms(id) ON DELETE CASCADE,
-    author_id UUID NOT NULL REFERENCES users(id),
-    content VARCHAR(1000) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX idx_group_messages_group_created ON group_messages(group_id, created_at);
-
 CREATE TABLE app_settings (
     setting_key VARCHAR(40) PRIMARY KEY,
     setting_value INTEGER NOT NULL,
@@ -80,10 +55,10 @@ CREATE TABLE active_rooms (
         '{"plant_health":100,"active_track":null,"theme":"default"}'::jsonb,
     status VARCHAR(16) NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'dissolved', 'graduated')),
-    user1_vote BOOLEAN,
-    user2_vote BOOLEAN,
     user1_share_vote BOOLEAN,
     user2_share_vote BOOLEAN,
+    user1_share_voted_at TIMESTAMPTZ,
+    user2_share_voted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     dissolved_at TIMESTAMPTZ,
     CHECK (user1_id <> user2_id)
@@ -124,9 +99,12 @@ CREATE TABLE room_assets (
     room_id UUID NOT NULL REFERENCES active_rooms(id) ON DELETE CASCADE,
     author_id UUID NOT NULL REFERENCES users(id),
     asset_type VARCHAR(20) NOT NULL CHECK
-        (asset_type IN ('sticky_note', 'polaroid', 'jukebox_track')),
-    content VARCHAR(140),
+        (asset_type IN ('sticky_note', 'polaroid', 'jukebox_track', 'chat_memory')),
+    content VARCHAR(1000),
     media_url TEXT,
+    emotion_tag VARCHAR(20) CHECK
+        (emotion_tag IS NULL OR emotion_tag IN ('happy', 'funny', 'deep', 'comforting', 'random')),
+    source_message_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_day DATE NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date)
 );
@@ -174,6 +152,11 @@ CREATE TABLE friendships (
     user2_id UUID NOT NULL REFERENCES users(id),
     archived_room_snapshot JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    continue_expires_at TIMESTAMPTZ,
+    user1_continue_vote BOOLEAN,
+    user2_continue_vote BOOLEAN,
+    user1_continue_voted_at TIMESTAMPTZ,
+    user2_continue_voted_at TIMESTAMPTZ,
     CHECK (user1_id <> user2_id)
 );
 
